@@ -1,0 +1,42 @@
+# HRRRCast conda environment for AWS GPU (Linux x86_64, CUDA).
+#
+# This is the upstream environment.yaml (the proven HPC/Ursa recipe) plus two
+# additions needed off-cluster: wgrib2 (HPC used `module load wgrib2`) and
+# git-lfs (to pull the model when not staged from S3).
+#
+# GPU: TensorFlow 2.15 gets its GPU build when CUDA looks present. Create the
+# env with CONDA_OVERRIDE_CUDA set, exactly as install_env_ursa.sh does:
+#     CONDA_OVERRIDE_CUDA="12.0" conda env create -f aws/environment.aws.yaml
+#
+# TF 2.15 is Keras 2 natively, so the pretrained Keras-2 model loads directly
+# (no tf-keras shim, no TF_USE_LEGACY_KERAS needed as on the arm64 Mac).
+name: hrrrcast
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - joblib
+  - matplotlib
+  - xarray
+  - dask
+  - seaborn
+  - fire
+  - xesmf
+  - netcdf4
+  - h5netcdf
+  - bottleneck
+  - cartopy
+  - tqdm
+  - pandas
+  - zarr
+  - pygrib
+  - tensorflow==2.15.0
+  - eccodes
+  - cf-units
+  - grib2io
+  - scikit-image
+  # off-cluster additions
+  - wgrib2
+  - git-lfs
