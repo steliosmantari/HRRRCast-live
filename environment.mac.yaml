@@ -1,0 +1,66 @@
+# HRRRCast conda environment for Apple Silicon (macOS / osx-arm64), CPU-only.
+# Verified on macOS 26.5 / arm64, 2026-07-15.
+#
+# Differences from environment.yaml (the Linux/HPC spec), each forced by this platform:
+#   - python 3.12: the only version with osx-arm64 conda-forge builds for the
+#     whole geoscience stack (grib2io, pygrib, xesmf/esmpy, wgrib2).
+#   - No pyarrow anywhere: the pyarrow 24.x arm64 build aborts (SIGABRT) on
+#     import, which crashes anything importing pandas (including tensorflow via
+#     tf-keras). Two edges pull it, both cut here:
+#       * pandas 3.0 -> pyarrow   => pin pandas<3
+#       * dask (meta) -> dask-expr -> pyarrow => use dask-core (xarray only
+#         needs dask-core anyway)
+#   - numpy<2.5: the pip TensorFlow 2.21 wheel is built against numpy <2.5;
+#     numpy 2.5.x drifts in unpinned and breaks TF's ABI. 2.4.x is verified.
+#   - xesmf>=0.8.7: older xesmf (0.6.0) does `import ESMF`, but esmpy 8.4+
+#     renamed that module to `esmpy`; recent xesmf imports it correctly.
+#   - TensorFlow comes from PyPI, not conda: the upstream ==2.15.0 pin has no
+#     arm64 build; the current TF wheel (2.21.0) installs cleanly and is CPU-only
+#     here. It is paired with tf-keras (Keras 2) so the Keras-2-saved
+#     net-diffusion/model.keras still loads under TF_USE_LEGACY_KERAS=1
+#     (set by install_env_mac.sh). Both are pinned to the same 2.21.x line.
+#   - conda-forge only (no defaults) to keep the compiled geo stack ABI-consistent.
+#   - git-lfs included: model.keras is a Git-LFS object that must be pulled.
+name: hrrrcast
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  # core numerics / io
+  - numpy<2.5           # TF 2.21 wheel ABI; 2.5.x breaks import
+  - pandas<3            # avoids the pyarrow-24 arm64 abort
+  - xarray
+  - dask-core           # NOT the dask meta: that pulls dask-expr -> pyarrow
+  - zarr
+  - netcdf4
+  - h5netcdf
+  - bottleneck
+  - cf-units
+  - joblib
+  - tqdm
+  - fire
+  - requests
+  - python-dateutil
+  # regridding (GFS -> HRRR grid)
+  - xesmf>=0.8.7        # older 0.6.0 does `import ESMF`; esmpy 8.4+ renamed it
+  - esmpy
+  # GRIB2 io / export
+  - pygrib
+  - eccodes
+  - grib2io
+  - wgrib2
+  # plotting
+  - matplotlib
+  - seaborn
+  - cartopy
+  - scikit-image
+  # tooling
+  - git-lfs
+  # TensorFlow (CPU) + Keras 2 shim from PyPI. Kept out of conda on purpose:
+  # no arm64 conda TF matches, and pairing pip tensorflow with pip tf-keras
+  # keeps tensorflow/keras/tf-keras mutually consistent.
+  - pip
+  - pip:
+      - tensorflow==2.21.0
+      - tf-keras==2.21.0

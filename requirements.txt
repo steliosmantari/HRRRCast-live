@@ -1,0 +1,37 @@
+# HRRRCast Python dependencies (reference list).
+#
+# NOTE: This project depends on compiled geoscience libraries (ESMF/esmpy,
+# eccodes, pygrib, grib2io, wgrib2, cartopy) that are not reliably pip-installable
+# on macOS/arm64. The supported install path is conda-forge via
+# environment.mac.yaml + install_env_mac.sh. This file documents the dependency
+# set and is what a pip-only environment would target.
+#
+# tensorflow: upstream pins ==2.15.0, which has no Apple-Silicon build. On this
+# machine TensorFlow + tf-keras come from PyPI at 2.21.0 (CPU). Keep in sync
+# with environment.mac.yaml.
+
+numpy<2.5  # TF 2.21 wheel ABI; numpy 2.5.x breaks the import
+pandas<3   # pandas 3.0 pulls pyarrow, whose arm64 build aborts on import
+xarray
+dask-core  # not the dask meta: it pulls dask-expr -> pyarrow
+zarr
+netcdf4
+h5netcdf
+bottleneck
+cf-units
+joblib
+tqdm
+fire
+requests
+python-dateutil
+xesmf
+esmpy
+pygrib
+eccodes
+grib2io
+matplotlib
+seaborn
+cartopy
+scikit-image
+tensorflow==2.19.1  # 2.15.0 on Linux/HPC; no arm64 build for 2.15
+tf-keras            # Keras 2 shim; requires TF_USE_LEGACY_KERAS=1 at runtime

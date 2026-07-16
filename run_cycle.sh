@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# run_cycle.sh — run one HRRRCast forecast cycle locally on this machine.
+#
+# Local (non-SLURM) counterpart to submit_all.sh. It runs the same pipeline
+# stages, in the same dependency order, with the same src/*.py commands the
+# jobs/job-*.sh templates use, but sequentially in one process instead of as
+# sbatch jobs with afterok dependencies (there is no scheduler or GPU array on
+# a workstation). Stages are fatal: the cycle stops on the first failure,
+# mirroring submit_all.sh's submit_with_check.
+#
+# Usage (same positional interface as submit_all.sh):
+#   ./run_cycle.sh <INIT_TIME> <LEAD_HOUR> <N_ENSEMBLES> <N_GPUS> <PACKAGEROOT> <DATAROOT> <RUNPLOT> <ENVMODE>
+#
+#   INIT_TIME    init time, YYYY-MM-DDTHH (e.g. 2024-05-06T23)   [default 2024-07-17T23]
+#   LEAD_HOUR    number of forecast hours                        [default 18]
+#   N_ENSEMBLES  ensemble members                                [default 1]
+#   N_GPUS       accepted for interface parity; ignored (all members run in one
+#                process here — there is no GPU job array locally)  [default 1]
+#   PACKAGEROOT  repo root                                        [default: script dir]
+#   DATAROOT     working/output data root                         [default: $PWD]
+#   RUNPLOT      YES|NO, run plotting stage                        [default YES]
+#   ENVMODE      OPN uses etc/env_emc.sh; otherwise etc/env_mac.sh [default local]
+#
+# Forecast (src/fcst.py) options are overridable via environment variables
+# (defaults match fcst.py):
+#   BATCH_SIZE=1  LOG_LEVEL=INFO  PMM_ALPHA=0.7  NOISE_RHO=0.9
+#   NO_DIFFUSION=NO   (YES -> --no_diffusion, deterministic model)
+#   NO_NUDGING=YES    (YES -> --no_nudging; matches jobs/job-fcst.sh)
+#
+# Example: 6-hour, single-member cycle
+#   ./run_cycle.sh 2024-05-06T23 6 1
+# Example: deterministic, 3-member, DEBUG logging
+#   NO_DIFFUSION=YES LOG_LEVEL=DEBUG ./run_cycle.sh 2024-05-06T23 6 3
+#
+set -euo pipefail
+
+INIT_TIME=${1:-"2024-07-17T23"}
+LEAD_HOUR=${2:-18}
+N_ENSEMBLES=${3:-1}
+N_GPUS=${4:-1}                       # interface parity only; unused locally
+PACKAGEROOT=${5:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"}
+DATAROOT=${6:-"$(pwd)"}
+RUNPLOT=${7:-"YES"}
+ENVMODE=${8:-""}
+
+# Runtime knobs (same defaults as submit_all.sh).
+export NETCDF2GRIB_SECTION3=${NETCDF2GRIB_SECTION3:-}
+export WGRIB2=${WGRIB2:-wgrib2}      # provided by the conda env on this machine
+export PMM_POLL_SECONDS=${PMM_POLL_SECONDS:-60}
+export PMM_MIN_AGE_SECONDS=${PMM_MIN_AGE_SECONDS:-90}
+
+# Forecast options (src/fcst.py) — env-var overridable; defaults match fcst.py.
+#   model_path / inittime / lead_hours    <- MODEL / INIT_TIME / LEAD_HOUR (above)
+#   --num_members                         <- N_ENSEMBLES (above)
+#   --members                             <- MEMBER_RANGE (below)
+#   --base_dir / --output_dir             <- DATAROOT (above)
+BATCH_SIZE=${BATCH_SIZE:-1}          # --batch_size
+LOG_LEVEL=${LOG_LEVEL:-INFO}         # --log_level (DEBUG|INFO|WARNING|ERROR)
+PMM_ALPHA=${PMM_ALPHA:-0.7}          # --pmm_alpha (nudge toward PMM mean, 0..1)
+NOISE_RHO=${NOISE_RHO:-0.9}          # --noise_rho (noise blend/correlation, 0..1)
+NO_DIFFUSION=${NO_DIFFUSION:-NO}     # --no_diffusion when YES (deterministic model)
+NO_NUDGING=${NO_NUDGING:-YES}        # --no_nudging when YES (jobs/job-fcst.sh always passes it)
+
+# Assemble the store_true forecast flags (empty-array-safe under set -u).
+FCST_FLAGS=()
+[ "$NO_DIFFUSION" == "YES" ] && FCST_FLAGS+=(--no_diffusion)
+[ "$NO_NUDGING"   == "YES" ] && FCST_FLAGS+=(--no_nudging)
+
+# init-time date/hour components (mirrors job-make-bcs.sh).
+DATE=${INIT_TIME%%T*}; DATE=${DATE//-/}
+HOUR=${INIT_TIME#*T}
+
+log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
+die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --- environment (mirrors "source ${PACKAGEROOT}/etc/env.sh" in the jobs) ---
+if [ "$ENVMODE" == "OPN" ]; then
+    # shellcheck disable=SC1091
+    source "${PACKAGEROOT}/etc/env_emc.sh"
+else
+    # shellcheck disable=SC1091
+    source "${PACKAGEROOT}/etc/env_mac.sh"
+fi
+
+MODEL="${PACKAGEROOT}/net-diffusion/model.keras"
+STATS="${PACKAGEROOT}/net-diffusion/normalize-stats.nc"
+[ -f "$MODEL" ] || die "Model not found: $MODEL (run install_env_mac.sh to pull the LFS object)."
+[ -f "$STATS" ] || die "Normalization stats not found: $STATS"
+
+mkdir -p "${DATAROOT}/logs"
+cd "$DATAROOT"
+
+# Single process handles all members (no GPU array); full member range.
+MEMBER_RANGE="0-$((N_ENSEMBLES-1))"
+
+echo "PACKAGEROOT=$PACKAGEROOT, DATAROOT=$DATAROOT"
+echo "INIT_TIME=$INIT_TIME, LEAD_HOUR=$LEAD_HOUR, N_ENSEMBLES=$N_ENSEMBLES, MEMBER_RANGE=$MEMBER_RANGE, RUNPLOT=$RUNPLOT"
+
+# run_stage NAME <command...> : tee to logs/NAME.out, fatal on failure.
+run_stage() {
+    local name="$1"; shift
+    log "Stage: ${name}"
+    echo "+ $*" | tee "${DATAROOT}/logs/${name}.out"
+    if ! "$@" 2>&1 | tee -a "${DATAROOT}/logs/${name}.out"; then
+        die "Stage '${name}' failed (see ${DATAROOT}/logs/${name}.out)."
+    fi
+}
+
+# --- Stage 1: get ICs  (jobs/job-get-ics.sh) --------------------------------
+run_stage get-ics \
+    python3 "${PACKAGEROOT}/src/get_ics.py" "${INIT_TIME}" --base_dir "${DATAROOT}"
+
+# --- Stage 2: get BCs  (jobs/job-get-bcs.sh) --------------------------------
+run_stage get-bcs \
+    python3 "${PACKAGEROOT}/src/get_bcs.py" "${INIT_TIME}" "${LEAD_HOUR}" --base_dir "${DATAROOT}"
+
+# --- Stage 3: make ICs  (depends on get-ics; jobs/job-make-ics.sh) ----------
+run_stage make-ics \
+    python3 "${PACKAGEROOT}/src/make_ics.py" "${STATS}" "${INIT_TIME}" \
+        --base_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+
+# --- Stage 4: make BCs  (depends on get-bcs; jobs/job-make-bcs.sh) ----------
+run_stage make-bcs \
+    python3 "${PACKAGEROOT}/src/make_bcs.py" "${STATS}" "${INIT_TIME}" "${LEAD_HOUR}" \
+        --base_dir "${DATAROOT}" --output_dir "${DATAROOT}" \
+        --hrrr_grid_file "${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+
+# --- Stage 5: forecast  (depends on make-ics + make-bcs; jobs/job-fcst.sh) --
+run_stage fcst \
+    python3 "${PACKAGEROOT}/src/fcst.py" "${MODEL}" "${INIT_TIME}" "${LEAD_HOUR}" \
+        --num_members "${N_ENSEMBLES}" --members "${MEMBER_RANGE}" \
+        --batch_size "${BATCH_SIZE}" --log_level "${LOG_LEVEL}" \
+        --pmm_alpha "${PMM_ALPHA}" --noise_rho "${NOISE_RHO}" \
+        ${FCST_FLAGS[@]+"${FCST_FLAGS[@]}"} \
+        --base_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+
+# --- Stage 6: plot members  (depends on fcst; jobs/job-plot.sh) -------------
+if [ "$RUNPLOT" == "YES" ]; then
+    run_stage plot \
+        python3 "${PACKAGEROOT}/src/plot.py" "${INIT_TIME}" "${LEAD_HOUR}" \
+            --members "${MEMBER_RANGE}" --forecast_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+fi
+
+# --- Stage 7: ensemble PMM (+ mean/spread plot) -----------------------------
+if [ "$N_ENSEMBLES" -ge 2 ]; then
+    run_stage compute-pmm \
+        python3 "${PACKAGEROOT}/src/compute_pmm.py" "${INIT_TIME}" "${LEAD_HOUR}" \
+            --forecast_dir "${DATAROOT}" --output_dir "${DATAROOT}" --n_ensembles "${N_ENSEMBLES}"
+
+    if [ "$RUNPLOT" == "YES" ]; then
+        # non-array plot path plots the mean/spread (jobs/job-plot.sh: "avg spr")
+        run_stage plot-pmm \
+            python3 "${PACKAGEROOT}/src/plot.py" "${INIT_TIME}" "${LEAD_HOUR}" \
+                --members avg spr --forecast_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+    fi
+fi
+
+log "Forecast cycle complete. Outputs under ${DATAROOT}/${DATE}/${HOUR}/  (logs in ${DATAROOT}/logs/)"

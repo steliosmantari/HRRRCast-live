@@ -168,7 +168,15 @@ class TimeCondLayer(Layer):
         self.use_noise = use_noise
 
     def call(self, inputs):
-        time_feats = tf.gather(inputs, self.time_mask, axis=-1)  # (B, H, W, 2)
+        # Normalize negative indices (e.g. [-2, -1] -> last two channels) to
+        # positive ones. tf.gather does not wrap negatives, and only the GPU
+        # kernel tolerates out-of-range indices (silently); the CPU kernel
+        # raises. Doing this makes the same codebase run on CPU and GPU with
+        # identical, correct semantics.
+        n_channels = tf.shape(inputs)[-1]
+        mask = tf.convert_to_tensor(self.time_mask, dtype=tf.int32)
+        mask = tf.where(mask < 0, mask + n_channels, mask)
+        time_feats = tf.gather(inputs, mask, axis=-1)  # (B, H, W, 2)
         d = time_feats[:, 0, 0, :]  # (B, 2)
 
         if not self.use_crps:
