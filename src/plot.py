@@ -474,7 +474,24 @@ class ForecastPlotter:
             logger.error(f"Error creating summary plot: {e}")
 
 
+def _init_worker(log_level):
+    """Initialize the module-global logger in each pool worker.
+
+    On macOS (and any spawn start method) worker processes re-import this module
+    fresh, so the module-global `logger` is None and `main()` never ran there.
+    The plotter methods use `logger.*`, so without this they raise
+    'NoneType' object has no attribute 'info'. On fork (Linux) the child already
+    inherits an initialized logger and this simply re-affirms it.
+    """
+    global logger
+    logger = setup_logging(log_level)
+
+
 def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, member, config_dict):
+    # Safety net for direct calls / non-pool execution (idempotent).
+    global logger
+    if logger is None:
+        logger = setup_logging()
     # Reconstruct config and plotter
     config = ForecastPlotterConfig()
     for k, v in config_dict.items():
@@ -513,8 +530,6 @@ def plot_forecast_data(datetime_str: str,
         config = ForecastPlotterConfig()
         config_dict = config.__dict__
         
-        n_workers = lead_hour_int
-        logger.info(f"Parallel plotting using {n_workers} workers (one per lead hour)")
         # Parallel plotting over lead hours
         args_list = []
         for h in range(1, lead_hour_int + 1):
@@ -524,13 +539,24 @@ def plot_forecast_data(datetime_str: str,
                 logger.warning(f"Skipping hour f{h:02d}: file not found {ds_path}")
                 continue
             args_list.append((h, ds_path, init_datetime, init_year, init_month, init_day, init_hh, output_dir, date_str, mem_str, config_dict))
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = [executor.submit(plot_lead_hour, *args) for args in args_list]
+
+        n_workers = max(1, len(args_list))
+        log_level = logging.getLevelName(logging.getLogger().getEffectiveLevel())
+        logger.info(f"Parallel plotting using {n_workers} workers (one per lead hour)")
+        errors = []
+        with ProcessPoolExecutor(max_workers=n_workers,
+                                 initializer=_init_worker, initargs=(log_level,)) as executor:
+            futures = {executor.submit(plot_lead_hour, *args): args[0] for args in args_list}
             for future in as_completed(futures):
+                h = futures[future]
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error(f"Error in parallel plotting: {e}")
+                    errors.append((h, e))
+                    logger.error(f"Error in parallel plotting (hour f{h:02d}): {e}")
+        if errors:
+            failed = ", ".join(f"f{h:02d}" for h, _ in sorted(errors))
+            raise RuntimeError(f"Plotting failed for {len(errors)} of {len(args_list)} hour(s): {failed}")
         logger.info(f"Plotting completed successfully for all hours 1 to {lead_hour_int}.")
         
     except Exception as e:
