@@ -134,8 +134,17 @@ class GridInterpolator:
 
 def process_single_lead_hour(args):
     """Process a single lead hour for both pressure and surface variables."""
+    # On macOS (spawn start method) pool workers re-import this module fresh, so
+    # the module-global `logger` is None and every logger.* call here raises
+    # 'NoneType' object has no attribute 'info'. Initialize it per worker. On
+    # Linux (fork) the worker already inherits an initialized logger, so this is
+    # a harmless no-op there.
+    global logger
+    if logger is None:
+        logger = setup_logging()
+
     lead_time, init_datetime, base_dir, norm_file, hrrr_grid_file = args
-    
+
     # Create a new preprocessor instance for this process
     config = WeatherPreprocessConfig(hrrr_grid_file)
     preprocessor = GRIBPreprocessor(config)
@@ -524,9 +533,20 @@ def preprocess_grib_data(norm_file: str, datetime_str: str,
         logger.info("Data will be interpolated to HRRR grid (no downsampling)")
         logger.info("Reading from separate GRIB files for each lead time based on valid time")
         
-        # Set n_workers to number of lead hours (1 to max_lead_time inclusive)
-        n_workers = max_lead_time if max_lead_time > 0 else 1
-        logger.info(f"Using {n_workers} worker processes for parallel processing (one per lead hour, skipping 0th hour)")
+        # Worker count: default is one per lead hour (HPC behavior, unchanged).
+        # On memory-constrained hosts each worker holds large GFS + regridded
+        # HRRR-grid arrays, so many parallel workers can exhaust RAM and get
+        # OOM-killed ("A process in the process pool was terminated abruptly").
+        # MAKE_BCS_WORKERS caps the pool; it is clamped to [1, one-per-lead-hour].
+        default_workers = max_lead_time if max_lead_time > 0 else 1
+        try:
+            n_workers = int(os.environ.get("MAKE_BCS_WORKERS", default_workers))
+        except ValueError:
+            logger.warning(f"Invalid MAKE_BCS_WORKERS={os.environ.get('MAKE_BCS_WORKERS')!r}; using {default_workers}")
+            n_workers = default_workers
+        n_workers = max(1, min(n_workers, default_workers))
+        logger.info(f"Using {n_workers} worker process(es) for parallel processing "
+                    f"(default {default_workers} = one per lead hour; override with MAKE_BCS_WORKERS)")
         
         # Setup paths
         init_datetime, init_year, init_month, init_day, init_hh = utils.validate_datetime(datetime_str)
