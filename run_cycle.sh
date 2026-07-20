@@ -28,6 +28,9 @@
 #   NO_DIFFUSION=NO   (YES -> --no_diffusion, deterministic model)
 #   NO_NUDGING=YES    (YES -> --no_nudging; matches jobs/job-fcst.sh)
 #
+# make_bcs regridding worker cap (avoids OOM on small-RAM hosts):
+#   MAKE_BCS_WORKERS  (unset -> one worker per lead hour; set 1 or 2 on 16 GiB)
+#
 # Example: 6-hour, single-member cycle
 #   ./run_cycle.sh 2024-05-06T23 6 1
 # Example: deterministic, 3-member, DEBUG logging
@@ -49,6 +52,12 @@ export NETCDF2GRIB_SECTION3=${NETCDF2GRIB_SECTION3:-}
 export WGRIB2=${WGRIB2:-wgrib2}      # provided by the conda env on this machine
 export PMM_POLL_SECONDS=${PMM_POLL_SECONDS:-60}
 export PMM_MIN_AGE_SECONDS=${PMM_MIN_AGE_SECONDS:-90}
+
+# make_bcs GFS->HRRR regridding worker cap. Default (unset) is one worker per
+# lead hour, which can OOM on small-RAM hosts. Set MAKE_BCS_WORKERS=1 or 2 on
+# memory-constrained instances (e.g. a 16 GiB g5.xlarge). Exported so make_bcs.py
+# picks it up; only exported when set, so the default behavior is unchanged.
+[ -n "${MAKE_BCS_WORKERS:-}" ] && export MAKE_BCS_WORKERS
 
 # Forecast options (src/fcst.py) — env-var overridable; defaults match fcst.py.
 #   model_path / inittime / lead_hours    <- MODEL / INIT_TIME / LEAD_HOUR (above)
