@@ -38,11 +38,16 @@ New files (none of the original HPC files were removed; the SLURM path still wor
 | `etc/env_mac.sh` | Env activation shim; parallels `etc/env.sh` and `etc/env_emc.sh`. |
 | `run_cycle.sh` | Local forecast-cycle driver; non-SLURM counterpart to `submit_all.sh`. |
 
-One edit to existing source:
+Edits to existing source (portability fixes; each is a no-op or correct on
+Linux/HPC/GPU, so they are safe to propagate to the other checkouts):
 
 | File | Change |
 |------|--------|
-| `src/resnet.py` | `TimeCondLayer.call` now normalizes negative gather indices so the same code runs on CPU and GPU. See [below](#model-code-change-timecondlayer). |
+| `src/resnet.py` | `TimeCondLayer.call` normalizes negative gather indices so the same code runs on CPU and GPU. See [below](#model-code-change-timecondlayer). |
+| `src/plot.py` | Plot pool workers initialize their own logger. On macOS (spawn start method) workers otherwise raise `'NoneType' object has no attribute 'info'`. |
+| `src/make_bcs.py` | `MAKE_BCS_WORKERS` caps the GFS-regridding worker pool to avoid OOM on small-RAM hosts (default is unchanged: one worker per lead hour). |
+| `src/utils.py` | `setup_logging` forces the log level (`force=True`) so `--log_level DEBUG` actually takes effect even after TensorFlow installs a root log handler. |
+| `etc/env_mac.sh` | Sets `TF_USE_LEGACY_KERAS` conditionally on whether `tf_keras` is installed (see the Keras 2 shim note). |
 
 ## Installation
 
@@ -65,7 +70,8 @@ The script:
 1. Creates or updates the `hrrrcast` conda env from `environment.mac.yaml`
    (`CONDA_SUBDIR=osx-arm64`), with a retry plus classic-solver fallback for the
    intermittent libmamba solver crash on arm64.
-2. Pins `TF_USE_LEGACY_KERAS=1` into the env (Keras 2 shim; see below).
+2. Pins `TF_USE_LEGACY_KERAS=1` into the env when `tf_keras` is installed (the
+   Keras 2 shim; see below).
 3. Pulls the Git LFS model object and resolves the pointer from the local cache.
 4. Downloads Cartopy Natural Earth shapefiles.
 5. Verifies the full stack imports and that the pretrained model loads.
@@ -80,7 +86,8 @@ conda activate hrrrcast
 ```
 
 or, from scripts, `source etc/env_mac.sh` (mirrors how the job scripts source
-`etc/env.sh`). This also exports `TF_USE_LEGACY_KERAS=1`.
+`etc/env.sh`). It also sets `TF_USE_LEGACY_KERAS` conditionally: `1` when
+`tf_keras` is installed (this Mac env), `0` otherwise (see the Keras 2 shim note).
 
 ## Quick Start
 
@@ -120,6 +127,25 @@ Example (deterministic, 3-member, DEBUG logging):
 NO_DIFFUSION=YES LOG_LEVEL=DEBUG ./run_cycle.sh 2024-05-06T23 6 3
 ```
 
+`LOG_LEVEL=DEBUG` emits real debug output only with the `src/utils.py`
+`setup_logging` fix (`force=True`); without it `basicConfig` is a no-op once
+TensorFlow has installed a root handler and DEBUG is silently ignored.
+
+### make_bcs worker cap
+
+`make_bcs` regrids GFS to the HRRR grid with **one worker process per lead hour**
+by default. Each worker holds large GFS and regridded HRRR-grid arrays, so on a
+memory-constrained host (e.g. a 16 GiB cloud box) many parallel workers can
+exhaust RAM and a worker gets OOM-killed (`A process in the process pool was
+terminated abruptly`). Cap the pool with `MAKE_BCS_WORKERS` (clamped to
+`[1, one-per-lead-hour]`):
+
+```bash
+MAKE_BCS_WORKERS=2 ./run_cycle.sh 2024-05-06T23 6 1   # or =1 for guaranteed-safe/serial
+```
+
+Leaving it unset keeps the original one-per-lead-hour behavior.
+
 ## End-to-End Pipeline (Local)
 
 `run_cycle.sh` runs the same stages as `submit_all.sh`, in the same dependency
@@ -152,11 +178,15 @@ platform:
   full geoscience stack (`grib2io`, `pygrib`, `xesmf`/`esmpy`, `wgrib2`).
 - **TensorFlow from PyPI, not conda**: the upstream `==2.15.0` pin has no arm64
   build. The install uses `tensorflow==2.21.0` (CPU) plus `tf-keras==2.21.0`.
-- **Keras 2 shim**: TF 2.21 defaults to Keras 3, but the pretrained
+- **Keras 2 shim (conditional)**: TF 2.21 defaults to Keras 3, but the pretrained
   `net-diffusion/model.keras` was saved under Keras 2 with custom registered
-  layers. `TF_USE_LEGACY_KERAS=1` routes `tf.keras` to `tf-keras` so the model
-  loads. This is set both in the env (`conda env config vars`) and in
-  `etc/env_mac.sh`.
+  layers. When `tf_keras` is installed (this Mac env), `TF_USE_LEGACY_KERAS=1`
+  routes `tf.keras` to it so the model loads via the legacy path.
+  `etc/env_mac.sh` sets the flag from `tf_keras` availability, so an environment
+  without `tf_keras` (e.g. an AWS GPU box on Keras 3, which loads the model
+  natively once `fcst.py` imports the custom layers) is not forced into the
+  broken `TF_USE_LEGACY_KERAS=1` + no-`tf_keras` state that yields
+  "Keras cannot be imported".
 - **`numpy<2.5`**: the pip TensorFlow 2.21 wheel is built against numpy < 2.5;
   numpy 2.5.x breaks the import (abort). 2.4.x is verified.
 - **`dask-core` instead of `dask`**: the `dask` metapackage pulls `dask-expr`,
@@ -219,8 +249,10 @@ Properties:
   and ensemble conditioning would have been degraded even on GPU. The patch makes
   the intended behavior explicit on both platforms.
 
-`src/resnet.py` is the only source file changed for local support; propagate it
-to the GPU/HPC checkouts.
+This is one of several small portability fixes (see [What Changed](#what-changed)):
+`resnet.py`, `plot.py`, `make_bcs.py`, and `utils.py`, plus the conditional-shim
+logic in `etc/env_mac.sh`. Each is a no-op or correct on Linux/GPU, so propagate
+them to the GPU/HPC checkouts.
 
 ## Impact of Running Locally
 
@@ -257,6 +289,19 @@ local path is intended for development, preprocessing, and small validation runs
   `src/` on `sys.path`) first; `run_cycle.sh` and the pipeline do this.
 - **`model.keras` is a 134-byte text file**: it is still an LFS pointer. See
   [Model Weights](#model-weights-git-lfs).
+- **make-bcs: `A process in the process pool was terminated abruptly`**: a GFS
+  regridding worker was OOM-killed. Cap the pool with `MAKE_BCS_WORKERS=2` (or
+  `1`); see [make_bcs worker cap](#make_bcs-worker-cap).
+- **plot: `'NoneType' object has no attribute 'info'`**: macOS spawn workers had
+  no logger; fixed in `src/plot.py` (per-worker logger init). Make sure the
+  checkout includes that fix.
+- **`Keras cannot be imported` / `TF_USE_LEGACY_KERAS set to True but ... tf_keras`
+  not installed**: the legacy-Keras flag is on but `tf_keras` is absent. Let
+  `etc/env_mac.sh` set the flag conditionally (it does), or `export
+  TF_USE_LEGACY_KERAS=0` in an env without `tf_keras`, or `pip install` a
+  `tf_keras` matching the TF version.
+- **`--log_level DEBUG` prints no DEBUG lines**: needs the `src/utils.py`
+  `setup_logging` fix (`force=True`); update the checkout.
 
 ## File Manifest
 
@@ -264,7 +309,10 @@ local path is intended for development, preprocessing, and small validation runs
 install_env_mac.sh      # local installer (arm64/CPU)
 environment.mac.yaml    # conda-forge env spec (osx-arm64)
 requirements.txt        # pip-style dependency reference
-etc/env_mac.sh          # env activation shim
-run_cycle.sh            # local forecast-cycle driver
-src/resnet.py           # TimeCondLayer negative-index fix (edited)
+etc/env_mac.sh          # env activation shim; conditional TF_USE_LEGACY_KERAS (edited)
+run_cycle.sh            # local forecast-cycle driver (fcst args + MAKE_BCS_WORKERS knobs)
+src/resnet.py           # TimeCondLayer negative-index CPU/GPU fix (edited)
+src/plot.py             # per-worker logger init for macOS spawn (edited)
+src/make_bcs.py         # MAKE_BCS_WORKERS worker cap to avoid OOM (edited)
+src/utils.py            # setup_logging force=True so --log_level DEBUG applies (edited)
 ```
