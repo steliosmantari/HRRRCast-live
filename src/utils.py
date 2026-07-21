@@ -36,11 +36,17 @@ def make_directory(path: Union[str, Path]) -> None:
 
 def setup_logging(log_level: str = 'INFO') -> logging.Logger:
     """Configure root logging (idempotent across modules)."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    # force=True re-applies config even if a root handler already exists (e.g.
+    # TensorFlow/absl install one on import). Without it basicConfig is a no-op
+    # and --log_level DEBUG never takes effect. setLevel is belt-and-suspenders.
     logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO),
+        level=level,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        datefmt='%Y-%m-%d %H:%M:%S',
+        force=True,
     )
+    logging.getLogger().setLevel(level)
     return logging.getLogger(__name__)
 
 def create_output_directory(base_dir: str, date_str: str) -> Path:
