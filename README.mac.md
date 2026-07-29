@@ -120,6 +120,11 @@ matching `fcst.py`:
 | `NOISE_RHO` | `--noise_rho` | `0.9` |
 | `NO_DIFFUSION` | `--no_diffusion` when `YES` | `NO` |
 | `NO_NUDGING` | `--no_nudging` when `YES` | `YES` (matches `jobs/job-fcst.sh`) |
+| `NO_GRIB2` | `--no_grib2` when `YES` | `NO` |
+| `NC_COMPLEVEL` | `--nc_complevel` | `0` (uncompressed) |
+| `NC_LSD` | `--nc_least_significant_digit` | unset (off) |
+| `S3_OUTPUT` | `--s3_output` | unset (no upload) |
+| `PURGE_LOCAL` | `--purge_local` when `YES` | `NO` |
 
 Example (deterministic, 3-member, DEBUG logging):
 
@@ -145,6 +150,31 @@ MAKE_BCS_WORKERS=2 ./run_cycle.sh 2024-05-06T23 6 1   # or =1 for guaranteed-saf
 ```
 
 Leaving it unset keeps the original one-per-lead-hour behavior.
+
+### Output size and delivery
+
+`NO_GRIB2`, `NC_COMPLEVEL`, `NC_LSD`, `S3_OUTPUT`, and `PURGE_LOCAL` exist for the
+AWS path but work locally too. Defaults preserve the original behavior exactly:
+GRIB2 written, NetCDF uncompressed, no upload.
+
+Measured on a real f01 file (1059x1799, 62 variables, ~1.36 GB uncompressed):
+`NC_COMPLEVEL=1` gives 1.54x lossless, and higher levels add almost nothing.
+`NC_LSD=2` gives 3.82x but is **lossy** (max abs error 0.0039 in native units),
+so it is off by default. Full table in
+[aws/README_aws.md](aws/README_aws.md#output-size).
+
+`PURGE_LOCAL=YES` deletes each NetCDF after a confirmed upload. `run_cycle.sh`
+refuses to combine it with the plot or ensemble-PMM stages, both of which read
+the NetCDF back; run those separately (see `aws/run_plots.sh`).
+
+Quick local smoke test of the forecast path, 2 lead hours:
+
+```bash
+NO_GRIB2=YES NC_COMPLEVEL=1 MAKE_BCS_WORKERS=2 ./run_cycle.sh 2026-07-20T00 2 1 1 "$PWD" "$PWD" NO
+```
+
+Expect roughly 30 minutes per lead hour on Apple Silicon CPU; this validates the
+pipeline, not performance.
 
 ## End-to-End Pipeline (Local)
 

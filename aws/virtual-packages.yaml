@@ -1,0 +1,28 @@
+# Virtual packages for conda-lock, describing the *target* machine (a CUDA GPU
+# instance) rather than the machine doing the locking.
+#
+# Why this file must exist: environment.aws.yaml relies on conda seeing a CUDA
+# runtime to select the GPU build of TensorFlow 2.15. Interactively that is done
+# with CONDA_OVERRIDE_CUDA=12.0, but conda-lock does NOT read that variable when
+# solving for a platform, so without this spec it resolves
+# tensorflow-2.15.0-cpu_* with no CUDA packages at all. That failure is silent:
+# the environment builds fine and the forecast then runs on CPU at roughly
+# 1,700 s per lead hour instead of 35 s on an L40S.
+#
+# Verify after any re-lock:
+#   grep -oE 'tensorflow-2[^#]*' aws/conda-linux-64.lock   # must say cuda_, not cpu_
+#
+# Usage:
+#   conda-lock lock --file aws/environment.aws.yaml --platform linux-64 \
+#       --virtual-package-spec aws/virtual-packages.yaml \
+#       --lockfile aws/conda-lock.yml
+#
+# The non-CUDA entries restate conda-lock's own defaults; supplying a spec
+# replaces the defaults wholesale, so they have to be listed explicitly.
+subdirs:
+  linux-64:
+    packages:
+      __cuda: "12.0"
+      __glibc: "2.17"
+      __linux: "5.10"
+      __unix: "0"

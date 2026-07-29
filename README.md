@@ -6,6 +6,7 @@ HRRRCast is a neural network-based, high‑resolution regional weather forecasti
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Running on AWS](#running-on-aws)
 - [Ensemble and PMM Support](#ensemble-and-pmm-support)
 - [End‑to‑End Pipeline](#end-to-end-pipeline)
 - [Model Usage](#model-usage)
@@ -120,6 +121,152 @@ python src/plot.py <inittime> <lead_hour> --members 0-2 --forecast_dir <forecast
 Forecasts run via `src/fcst.py` write **both NetCDF and GRIB2** outputs by default (per-hour files during rollout). GRIB2 export uses `grib2io`, `eccodes`, and system `wgrib2`.
 
 If you need a standalone conversion utility, use `src/nc2grib.py` (see `Netcdf2Grib`).
+
+## Running on AWS
+
+An on-demand AWS path exists: one command launches a GPU instance, runs a cycle,
+streams NetCDF to S3, and terminates itself. Plotting is a separate job.
+
+```bash
+aws/run_on_ec2.sh --bucket <your-bucket>                    # 24 h, latest cycle
+aws/run_on_ec2.sh --bucket <your-bucket> --preflight-only   # check the account, launch nothing
+aws/status.sh --live                                        # what is running right now
+```
+
+Full documentation, including account setup, measured timings, and the hardware
+constraints, is in **[aws/README_aws.md](aws/README_aws.md)**. The essentials:
+
+| | |
+|---|---|
+| Instance | `g6e.2xlarge` (L40S 48 GB). **24 GB GPUs cannot run this model** |
+| Throughput | ~36 s per lead hour on the L40S, versus ~1,720 s on Apple Silicon CPU |
+| A 24 h forecast | ~50-60 min wall clock, ~9 GB of NetCDF |
+| Deliverable | NetCDF to S3, one file per lead hour, uploaded as it is written |
+
+### Pipeline options added for the AWS path
+
+All of these work locally too, and all default to the previous behavior:
+
+| `run_cycle.sh` env var | `src/fcst.py` argument | Default | Purpose |
+|---|---|---|---|
+| `NO_GRIB2` | `--no_grib2` | `NO` | NetCDF only; also drops the `wgrib2` dependency |
+| `NC_COMPLEVEL` | `--nc_complevel` | `0` | NetCDF zlib level. Measured: level 1 gives 1.54x on these fields and higher levels add nothing |
+| `NC_LSD` | `--nc_least_significant_digit` | unset | **Lossy** quantization. `2` gives 3.8x for max abs error 0.0039 in native units |
+| `S3_OUTPUT` | `--s3_output` | unset | Upload each file to S3 as it is written |
+| `PURGE_LOCAL` | `--purge_local` | `NO` | Delete the local copy after a confirmed upload |
+| `OVERLAP_FCST` | `--wait_for_input` | `NO` | Start the forecast before the input stages so its model load overlaps them (see below) |
+
+`src/plot.py` gained `--variables {all,surface,pressure}`. Surface-only is 52 of
+the ~173 figures per lead hour, so roughly 30% of the output and runtime.
+
+`MAKE_BCS_WORKERS` caps the `make_bcs` regridding pool. On AWS it is derived
+automatically from instance RAM; see [aws/user_data.sh](aws/user_data.sh). The
+binding constraint is memory, not cores: each worker holds ~15 GB and the parent
+holds ~1.25 GB per lead hour until the npz is written.
+
+### Performance notes on `make_bcs`
+
+`make_bcs` dominated wall clock on a 24-lead-hour cycle. Four changes took it from
+~42 min to ~14 min, all measured on AWS at 24 lead hours with 2 workers:
+
+| change | stage total |
+|---|---|
+| original | ~42 min |
+| single pass instead of two (see below) | 22.6 min |
+| float32 storage, no compression, no unused raw arrays | 14.1 min |
+| worker pool sized from measured memory (7 instead of 2) | 7.3 min |
+| regridding batched into one call per lead hour | **4.2 min** |
+
+All five are measured on AWS at 24 lead hours on a `g6e.2xlarge`: a **10x** reduction
+in the stage, which took a full 24-hour forecast from 79.5 min to ~35 min. Every
+step was verified against a reference npz before being accepted.
+
+**1. Every GFS file was regridded twice.** `process_pressure_levels()` and
+`process_surface_variables()` each called `process_single_lead_hour()` with
+identical arguments, and that function already returns both result sets, so each
+call discarded exactly what the other kept. `process_all_variables()` does one
+pass. Output is byte-identical; verified by comparing every array in the npz.
+
+**2. Arrays were stored float64 but consumed as float32.** `src/fcst.py` does
+`tf.convert_to_tensor(..., dtype=tf.float32)` on load, so half of every byte was
+discarded. Storing float32 halves worker memory, the pickle payload per lead hour,
+the parent's accumulated arrays (measured 29.5 -> 14.6 GB peak RSS) and the npz
+(13.4 -> 7.7 GB). Verified equivalent: max relative difference 3e-08, about 0.25
+ulp of float32.
+
+**3. The npz was compressed.** `np.savez_compressed` achieved only ~1.15x on these
+fields while costing **7.7 minutes** of single-threaded zlib. This file is scratch,
+deleted when the run ends, so that was a poor trade. Plain `np.savez` writes it in
+**12 seconds**. With float32 the uncompressed file is smaller than the old
+compressed one anyway.
+
+**4. Raw HRRR-grid values were built and returned but never used.** Every call site
+discarded them, so they cost worker memory and an extra pickle per lead hour.
+
+`save_preprocessed_data` also preallocates its output array rather than building a
+list and calling `np.array()` on it, which had made a second full copy of every
+lead hour.
+
+**5. The worker pool was capped far below what memory allowed.** The cap was set
+from a measurement that predated changes 2 and 4, and so conflated worker memory
+with the parent's float64 accumulation: it assumed 15 GB per worker when the
+measured peak is 1.89 GB (96 samples, top five 1.70-1.89). The pool is now sized
+from actual instance RAM, giving 7 workers instead of 2 on a `g6e.2xlarge` and
+halving the stage again.
+
+Scaling is sublinear: 3.5x the workers gave 2x the speedup. Load average was 2.47
+with 7 workers on 8 cores, so the workers were mostly blocked rather than computing.
+Profiling one lead hour showed why, and it was not what we assumed:
+
+| phase | seconds | share |
+|---|---|---|
+| `pg.open` (GRIB index scan) | 0.38 | 0.9% |
+| decode (`select` + `.values`) | 18.17 | 52% |
+| regrid, per-field loop (28 fields) | 16.74 | 48% |
+| **regrid, batched (same 28 fields)** | **0.79** | — |
+
+**6. Regridding was done once per 2-D field: ~43 xESMF calls per lead hour.** Each
+call re-streamed the sparse weight matrix from memory. `interpolate_many_to_hrrr_grid()`
+stacks the fields and makes **one** call, measured 21x faster on that step and
+bit-identical (max difference exactly 0). Both loops were restructured into decode ->
+batch regrid -> transform, preserving field order so the channel layout is unchanged.
+
+Note this profile also **ruled out GFS field subsetting** as a way to speed up
+`make_bcs`: `pg.open` is 0.9% of the work, and pygrib's `select()` already decodes
+only the requested fields, so a smaller input file would not reduce the 52% spent
+decoding. Subsetting would still cut the ~15 GB download in `get_bcs`, which is a
+separate stage.
+
+With regrid down to ~2% of a lead hour, decode now dominates and is cleanly
+CPU-bound per field, so worker scaling should be closer to linear than it was.
+
+### Overlapping the forecast's startup with input preparation
+
+`OVERLAP_FCST=YES` starts `src/fcst.py` *before* the input stages instead of after.
+The forecast's startup -- TensorFlow import, GPU initialization, and deserializing
+the 50M-parameter model -- takes about 4 minutes and depends on none of the input
+data, while the GPU sits idle for the whole input phase.
+
+`fcst.py` therefore loads the model first, then blocks on `--wait_for_input <path>`
+until `run_cycle.sh` creates a sentinel. The sentinel is created only after every
+input stage has succeeded, which is why the forecast waits on it rather than on the
+npz files: those appear before they are complete, so watching them would race.
+
+The overlap hides `min(model load, input phase)`, so which side dominates depends on
+forecast length. Both cases were measured on AWS:
+
+| lead hours | input phase | model load | outcome |
+|---|---|---|---|
+| 6 | ~2.7 min | ~3.8 min | inputs ready **69 s before** the model loaded; input phase costs nothing. Run 14.7 -> 12.5 min |
+| 24 | ~6 min | ~3.7 min | forecast **waited 206 s** for inputs; the model load is fully hidden instead. Run 79.5 -> 28.4 min overall |
+
+So at 6 lead hours the input stages are effectively free and further `make_bcs` work
+would buy nothing, while at the production length of 24 lead hours `make_bcs` is still
+on the critical path and savings there still convert to wall clock.
+
+If any input stage fails, `run_cycle.sh` kills the background forecast via an EXIT
+trap and exits non-zero -- verified by forcing a `get-ics` failure and confirming no
+orphaned process remains.
 
 ## Ensemble and PMM Support
 

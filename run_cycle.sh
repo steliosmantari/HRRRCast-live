@@ -28,6 +28,25 @@
 #   NO_DIFFUSION=NO   (YES -> --no_diffusion, deterministic model)
 #   NO_NUDGING=YES    (YES -> --no_nudging; matches jobs/job-fcst.sh)
 #
+# Output/delivery options (defaults keep the original local behavior):
+#   NO_GRIB2=NO       (YES -> NetCDF only; drops ~4 GB/cycle and the wgrib2 dep)
+#   NC_COMPLEVEL=0    (1-9 enables NetCDF zlib compression; 0 = uncompressed.
+#                      Measured: level 1 gives 1.54x on these fields, and higher
+#                      levels add almost nothing, so 1 is the useful setting.)
+#   NC_LSD=           (LOSSY quantization to N decimal digits before compression.
+#                      Measured: N=2 gives 3.8x at max abs error 0.004 in native
+#                      units, N=3 gives 3.0x at 0.0005. Empty = off.)
+#   S3_OUTPUT=        (s3://bucket/prefix; uploads each file as it is written)
+#   PURGE_LOCAL=NO    (YES -> delete local copies after upload; needs S3_OUTPUT.
+#                      Incompatible with RUNPLOT=YES in the same cycle: plotting
+#                      reads the NetCDF back. Run plots as a separate job.)
+#   OVERLAP_FCST=NO   (YES -> start the forecast before the input stages so its
+#                      TensorFlow import and model load, ~5 min and independent of
+#                      the input data, run while the inputs are being prepared. The
+#                      forecast blocks on a sentinel until they are ready. Saves
+#                      roughly the whole of that startup; the GPU is otherwise idle
+#                      for the entire input phase.)
+#
 # make_bcs regridding worker cap (avoids OOM on small-RAM hosts):
 #   MAKE_BCS_WORKERS  (unset -> one worker per lead hour; set 1 or 2 on 16 GiB)
 #
@@ -71,10 +90,23 @@ NOISE_RHO=${NOISE_RHO:-0.9}          # --noise_rho (noise blend/correlation, 0..
 NO_DIFFUSION=${NO_DIFFUSION:-NO}     # --no_diffusion when YES (deterministic model)
 NO_NUDGING=${NO_NUDGING:-YES}        # --no_nudging when YES (jobs/job-fcst.sh always passes it)
 
+# Output/delivery knobs (defaults preserve the original local behavior).
+NO_GRIB2=${NO_GRIB2:-NO}             # YES -> --no_grib2, NetCDF only
+NC_COMPLEVEL=${NC_COMPLEVEL:-0}      # --nc_complevel; 0 = uncompressed (original behavior)
+NC_LSD=${NC_LSD:-}                   # --nc_least_significant_digit (LOSSY; empty = off)
+S3_OUTPUT=${S3_OUTPUT:-}             # s3://bucket/prefix; empty disables upload
+PURGE_LOCAL=${PURGE_LOCAL:-NO}       # YES -> --purge_local (requires S3_OUTPUT)
+OVERLAP_FCST=${OVERLAP_FCST:-NO}     # YES -> start fcst early so its model load
+                                     # overlaps the input stages (see below)
+
 # Assemble the store_true forecast flags (empty-array-safe under set -u).
 FCST_FLAGS=()
 [ "$NO_DIFFUSION" == "YES" ] && FCST_FLAGS+=(--no_diffusion)
 [ "$NO_NUDGING"   == "YES" ] && FCST_FLAGS+=(--no_nudging)
+[ "$NO_GRIB2"     == "YES" ] && FCST_FLAGS+=(--no_grib2)
+[ -n "$NC_LSD" ]             && FCST_FLAGS+=(--nc_least_significant_digit "$NC_LSD")
+[ -n "$S3_OUTPUT" ]          && FCST_FLAGS+=(--s3_output "$S3_OUTPUT")
+[ "$PURGE_LOCAL"  == "YES" ] && FCST_FLAGS+=(--purge_local)
 
 # init-time date/hour components (mirrors job-make-bcs.sh).
 DATE=${INIT_TIME%%T*}; DATE=${DATE//-/}
@@ -90,6 +122,20 @@ if [ "$ENVMODE" == "OPN" ]; then
 else
     # shellcheck disable=SC1091
     source "${PACKAGEROOT}/etc/env_mac.sh"
+fi
+
+# PURGE_LOCAL deletes each NetCDF after upload, so nothing is left for plot.py
+# to read. Refuse the combination rather than producing an empty plot stage.
+if [ "$PURGE_LOCAL" == "YES" ] && [ "$RUNPLOT" == "YES" ]; then
+    die "PURGE_LOCAL=YES removes the NetCDF that the plot stage reads. Set RUNPLOT=NO and run plots separately (aws/run_plots.sh)."
+fi
+if [ "$PURGE_LOCAL" == "YES" ] && [ -z "$S3_OUTPUT" ]; then
+    die "PURGE_LOCAL=YES requires S3_OUTPUT; it would otherwise discard the outputs."
+fi
+# compute_pmm reads every member's NetCDF back off disk, so it has the same
+# conflict with PURGE_LOCAL as plotting does.
+if [ "$PURGE_LOCAL" == "YES" ] && [ "$N_ENSEMBLES" -ge 2 ]; then
+    die "PURGE_LOCAL=YES removes the NetCDF that the ensemble PMM stage reads. Run PMM as a separate job for multi-member cycles."
 fi
 
 MODEL="${PACKAGEROOT}/net-diffusion/model.keras"
@@ -116,33 +162,73 @@ run_stage() {
     fi
 }
 
-# --- Stage 1: get ICs  (jobs/job-get-ics.sh) --------------------------------
-run_stage get-ics \
-    python3 "${PACKAGEROOT}/src/get_ics.py" "${INIT_TIME}" --base_dir "${DATAROOT}"
+# Stages 1-4 prepare the inputs. Grouped in a function so the forecast can either
+# follow them (default) or run concurrently with them (OVERLAP_FCST=YES).
+run_input_stages() {
+    # --- Stage 1: get ICs  (jobs/job-get-ics.sh) ----------------------------
+    run_stage get-ics \
+        python3 "${PACKAGEROOT}/src/get_ics.py" "${INIT_TIME}" --base_dir "${DATAROOT}"
 
-# --- Stage 2: get BCs  (jobs/job-get-bcs.sh) --------------------------------
-run_stage get-bcs \
-    python3 "${PACKAGEROOT}/src/get_bcs.py" "${INIT_TIME}" "${LEAD_HOUR}" --base_dir "${DATAROOT}"
+    # --- Stage 2: get BCs  (jobs/job-get-bcs.sh) ----------------------------
+    run_stage get-bcs \
+        python3 "${PACKAGEROOT}/src/get_bcs.py" "${INIT_TIME}" "${LEAD_HOUR}" --base_dir "${DATAROOT}"
 
-# --- Stage 3: make ICs  (depends on get-ics; jobs/job-make-ics.sh) ----------
-run_stage make-ics \
-    python3 "${PACKAGEROOT}/src/make_ics.py" "${STATS}" "${INIT_TIME}" \
-        --base_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+    # --- Stage 3: make ICs  (depends on get-ics; jobs/job-make-ics.sh) ------
+    run_stage make-ics \
+        python3 "${PACKAGEROOT}/src/make_ics.py" "${STATS}" "${INIT_TIME}" \
+            --base_dir "${DATAROOT}" --output_dir "${DATAROOT}"
 
-# --- Stage 4: make BCs  (depends on get-bcs; jobs/job-make-bcs.sh) ----------
-run_stage make-bcs \
-    python3 "${PACKAGEROOT}/src/make_bcs.py" "${STATS}" "${INIT_TIME}" "${LEAD_HOUR}" \
-        --base_dir "${DATAROOT}" --output_dir "${DATAROOT}" \
-        --hrrr_grid_file "${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+    # --- Stage 4: make BCs  (depends on get-bcs; jobs/job-make-bcs.sh) ------
+    run_stage make-bcs \
+        python3 "${PACKAGEROOT}/src/make_bcs.py" "${STATS}" "${INIT_TIME}" "${LEAD_HOUR}" \
+            --base_dir "${DATAROOT}" --output_dir "${DATAROOT}" \
+            --hrrr_grid_file "${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+}
 
-# --- Stage 5: forecast  (depends on make-ics + make-bcs; jobs/job-fcst.sh) --
-run_stage fcst \
-    python3 "${PACKAGEROOT}/src/fcst.py" "${MODEL}" "${INIT_TIME}" "${LEAD_HOUR}" \
-        --num_members "${N_ENSEMBLES}" --members "${MEMBER_RANGE}" \
-        --batch_size "${BATCH_SIZE}" --log_level "${LOG_LEVEL}" \
-        --pmm_alpha "${PMM_ALPHA}" --noise_rho "${NOISE_RHO}" \
-        ${FCST_FLAGS[@]+"${FCST_FLAGS[@]}"} \
-        --base_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+FCST_CMD=(python3 "${PACKAGEROOT}/src/fcst.py" "${MODEL}" "${INIT_TIME}" "${LEAD_HOUR}"
+          --num_members "${N_ENSEMBLES}" --members "${MEMBER_RANGE}"
+          --batch_size "${BATCH_SIZE}" --log_level "${LOG_LEVEL}"
+          --pmm_alpha "${PMM_ALPHA}" --noise_rho "${NOISE_RHO}"
+          --nc_complevel "${NC_COMPLEVEL}"
+          ${FCST_FLAGS[@]+"${FCST_FLAGS[@]}"}
+          --base_dir "${DATAROOT}" --output_dir "${DATAROOT}")
+
+if [ "$OVERLAP_FCST" == "YES" ]; then
+    # The forecast's startup (TF import, GPU init, model load) needs no input data,
+    # so start it now and let it block on a sentinel. The sentinel is created only
+    # after the input stages have all succeeded, which is why the forecast waits on
+    # it rather than on the npz files themselves: the files appear before they are
+    # complete, so watching them would race.
+    READY="${DATAROOT}/${DATE}/${HOUR}/.inputs_ready"
+    mkdir -p "$(dirname "$READY")"; rm -f "$READY"
+
+    log "Stage: fcst (started early; will load the model, then wait for inputs)"
+    echo "+ ${FCST_CMD[*]} --wait_for_input ${READY}" > "${DATAROOT}/logs/fcst.out"
+    "${FCST_CMD[@]}" --wait_for_input "$READY" --wait_timeout 3600 \
+        >> "${DATAROOT}/logs/fcst.out" 2>&1 &
+    FCST_PID=$!
+    # Never leave the forecast orphaned if an input stage dies (run_stage calls die).
+    trap '[ -n "${FCST_PID:-}" ] && kill "$FCST_PID" 2>/dev/null; exit' EXIT INT TERM
+
+    run_input_stages
+
+    log "Inputs ready; releasing the forecast"
+    touch "$READY"
+
+    if wait "$FCST_PID"; then
+        trap - EXIT INT TERM; FCST_PID=""
+        log "Stage fcst complete (see ${DATAROOT}/logs/fcst.out)"
+    else
+        rc=$?
+        trap - EXIT INT TERM; FCST_PID=""
+        die "Stage 'fcst' failed with status ${rc} (see ${DATAROOT}/logs/fcst.out)."
+    fi
+else
+    run_input_stages
+
+    # --- Stage 5: forecast  (depends on make-ics + make-bcs) ---------------
+    run_stage fcst "${FCST_CMD[@]}"
+fi
 
 # --- Stage 6: plot members  (depends on fcst; jobs/job-plot.sh) -------------
 if [ "$RUNPLOT" == "YES" ]; then

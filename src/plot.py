@@ -63,6 +63,13 @@ class ForecastPlotterConfig:
         # Pressure levels (hPa)
         self.levels = [200, 300, 350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 825, 850, 875, 900, 925, 950, 975, 1000]
 
+        # Which variable groups to plot. Both on by default (original behavior).
+        # Plotting every pressure-level variable at 20 levels is 120 figures per
+        # lead hour, which dominates runtime and output size; surface-only is a
+        # common ask and much cheaper.
+        self.plot_pl = True
+        self.plot_sfc = True
+
         # Plot settings
         self.figure_size = (12, 8)
         self.dpi = 300
@@ -503,16 +510,22 @@ def plot_lead_hour(h, ds_path, init_datetime, init_year, init_month, init_day, i
         timestamp_str = f"{init_year}-{init_month}-{init_day} {init_hh}:00 UTC"
         output_subdir = f"{output_dir}/{date_str}/mem{member}_lead{h:02d}h"
         utils.make_directory(output_subdir)
-        plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
-        plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
-        plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
+        if getattr(config, "plot_pl", True):
+            plotter.plot_pressure_level_variables(ds, h, output_subdir, timestamp_str)
+        if getattr(config, "plot_sfc", True):
+            plotter.plot_surface_variables(ds, h, output_subdir, timestamp_str)
+        # The summary panel mixes surface and pressure-level fields, so it only
+        # makes sense when both groups were plotted.
+        if getattr(config, "plot_pl", True) and getattr(config, "plot_sfc", True):
+            plotter.create_summary_plot(ds, h, output_subdir, timestamp_str)
         logging.info(f"Plots for lead hour {h} saved to: {output_subdir}")
     finally:
         ds.close()
 
 def plot_forecast_data(datetime_str: str,
                       lead_hour: str, member: str,
-                      forecast_dir: str = "./", output_dir: str = "./"):
+                      forecast_dir: str = "./", output_dir: str = "./",
+                      variables: str = "all"):
     """Main plotting function. Plots all hours from 1 to lead_hour (inclusive) in parallel."""
     try:
         # Validate inputs
@@ -528,6 +541,13 @@ def plot_forecast_data(datetime_str: str,
 
         # Initialize plotter config (for passing to subprocesses)
         config = ForecastPlotterConfig()
+        config.plot_pl = variables in ("all", "pressure")
+        config.plot_sfc = variables in ("all", "surface")
+        logger.info(
+            f"Plotting variable groups: "
+            f"{'pressure-level ' if config.plot_pl else ''}"
+            f"{'surface' if config.plot_sfc else ''}".strip()
+        )
         config_dict = config.__dict__
         
         # Parallel plotting over lead hours
@@ -575,6 +595,9 @@ def parse_arguments():
                        help='Forecast initialization time in format YYYY-MM-DDTHH (e.g., "2024-05-06T23")')
     parser.add_argument("lead_hour", help="Lead hour for forecast (0, 1, 2, ...)")
     parser.add_argument("--members", nargs='+', required=True, help="List/range of member IDs (e.g., 0-2 4 6-7 pmm)")
+    parser.add_argument("--variables", default="all", choices=["all", "surface", "pressure"],
+                        help="Which variable groups to plot. 'surface' skips the 20-level "
+                             "pressure fields (about 120 of the ~170 figures per lead hour)")
     parser.add_argument("--forecast_dir", default="./", help="Directory containing forecast files")
     parser.add_argument("--output_dir", default="./", help="Output directory for plots")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -613,6 +636,7 @@ def main():
                 member=member,
                 forecast_dir=args.forecast_dir,
                 output_dir=args.output_dir,
+                variables=args.variables,
             )
     except Exception as e:
         logger.error(f"Application failed: {e}")
