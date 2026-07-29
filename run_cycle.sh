@@ -26,7 +26,6 @@
 # (defaults match fcst.py):
 #   BATCH_SIZE=1  LOG_LEVEL=INFO  PMM_ALPHA=0.7  NOISE_RHO=0.9
 #   NO_DIFFUSION=NO   (YES -> --no_diffusion, deterministic model)
-#   NO_NUDGING=YES    (YES -> --no_nudging; matches jobs/job-fcst.sh)
 #
 # Output/delivery options (defaults keep the original local behavior):
 #   NO_GRIB2=NO       (YES -> NetCDF only; drops ~4 GB/cycle and the wgrib2 dep)
@@ -88,7 +87,8 @@ LOG_LEVEL=${LOG_LEVEL:-INFO}         # --log_level (DEBUG|INFO|WARNING|ERROR)
 PMM_ALPHA=${PMM_ALPHA:-0.7}          # --pmm_alpha (nudge toward PMM mean, 0..1)
 NOISE_RHO=${NOISE_RHO:-0.9}          # --noise_rho (noise blend/correlation, 0..1)
 NO_DIFFUSION=${NO_DIFFUSION:-NO}     # --no_diffusion when YES (deterministic model)
-NO_NUDGING=${NO_NUDGING:-YES}        # --no_nudging when YES (jobs/job-fcst.sh always passes it)
+# NO_NUDGING was removed: upstream deleted nudging from src/fcst.py entirely
+# (commit fd13a09), so passing --no_nudging is now an argparse error.
 
 # Output/delivery knobs (defaults preserve the original local behavior).
 NO_GRIB2=${NO_GRIB2:-NO}             # YES -> --no_grib2, NetCDF only
@@ -102,7 +102,6 @@ OVERLAP_FCST=${OVERLAP_FCST:-NO}     # YES -> start fcst early so its model load
 # Assemble the store_true forecast flags (empty-array-safe under set -u).
 FCST_FLAGS=()
 [ "$NO_DIFFUSION" == "YES" ] && FCST_FLAGS+=(--no_diffusion)
-[ "$NO_NUDGING"   == "YES" ] && FCST_FLAGS+=(--no_nudging)
 [ "$NO_GRIB2"     == "YES" ] && FCST_FLAGS+=(--no_grib2)
 [ -n "$NC_LSD" ]             && FCST_FLAGS+=(--nc_least_significant_digit "$NC_LSD")
 [ -n "$S3_OUTPUT" ]          && FCST_FLAGS+=(--s3_output "$S3_OUTPUT")

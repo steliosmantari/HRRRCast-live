@@ -119,7 +119,6 @@ matching `fcst.py`:
 | `PMM_ALPHA` | `--pmm_alpha` | `0.7` |
 | `NOISE_RHO` | `--noise_rho` | `0.9` |
 | `NO_DIFFUSION` | `--no_diffusion` when `YES` | `NO` |
-| `NO_NUDGING` | `--no_nudging` when `YES` | `YES` (matches `jobs/job-fcst.sh`) |
 | `NO_GRIB2` | `--no_grib2` when `YES` | `NO` |
 | `NC_COMPLEVEL` | `--nc_complevel` | `0` (uncompressed) |
 | `NC_LSD` | `--nc_least_significant_digit` | unset (off) |

@@ -18,12 +18,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import numpy as np
 import tensorflow as tf
 import xarray as xr
 import pandas as pd
-from skimage.exposure import match_histograms
 
 from nc2grib import Netcdf2Grib
 import s3io
@@ -211,7 +211,6 @@ class WeatherForecaster:
         gfs_channels: Optional[int] = None,
         static_channels: Optional[int] = None,
         pmm_alpha: float = 0.65,
-        use_nudging: bool = True,
         diffusion_sampler: str = "dpmpp-2m",
         noise_rho: float = 0.9,
         write_grib2: bool = True,
@@ -228,7 +227,6 @@ class WeatherForecaster:
         self.use_diffusion = use_diffusion
         self.lead_hours = lead_hours
         self.pmm_alpha = pmm_alpha
-        self.use_nudging = use_nudging and len(members) > 1
         self.diffusion_sampler = diffusion_sampler
         self.noise_rho = noise_rho
         self.write_grib2 = write_grib2
@@ -308,135 +306,6 @@ class WeatherForecaster:
             self.member_anchors[member] = anchor
 
         logger.info("Member anchors initialized; noise will be generated on-the-fly during inference")
-
-    def _compute_pmm_mean(self, member_outputs: Dict[int, np.ndarray], method: int = 2) -> Tuple[np.ndarray, List[int]]:
-        """Compute PMM mean for REFC and APCP channels only.
-
-        Args:
-            member_outputs: Dict mapping member -> array shape (1, H, W, C) or (H, W, C)
-            method: PMM method (1 or 2)
-
-        Returns:
-            Tuple of (pmm_values, channel_indices)
-            - pmm_values: shape (H, W, num_pmm_channels) containing only REFC/APCP
-            - channel_indices: list of channel indices for REFC/APCP
-        """
-        if not member_outputs:
-            raise ValueError("member_outputs is empty; cannot compute PMM")
-
-        # Identify REFC and APCP channel indices
-        pl_vars = self.metadata['pl_vars']
-        sfc_vars = self.metadata['sfc_vars']
-        levels = self.metadata['levels']
-        num_pl_channels = len(pl_vars) * len(levels)
-        
-        pmm_channels = []
-        for var_name in ['REFC', 'APCP']:
-            if var_name in sfc_vars:
-                sfc_idx = sfc_vars.index(var_name)
-                channel_idx = num_pl_channels + sfc_idx
-                pmm_channels.append(channel_idx)
-        
-        if not pmm_channels:
-            # No REFC/APCP channels
-            members_sorted = sorted(member_outputs.keys())
-            first_arr = member_outputs[members_sorted[0]]
-            if first_arr.ndim == 4:
-                first_arr = first_arr[0]
-            ny, nx = first_arr.shape[:2]
-            return np.empty((ny, nx, 0), dtype=first_arr.dtype), []
-        
-        # Stack members for PMM computation
-        members_sorted = sorted(member_outputs.keys())
-        stack_list = []
-        for m in members_sorted:
-            arr = member_outputs[m]
-            if arr.ndim == 4:
-                arr = arr[0]
-            stack_list.append(arr)
-        stack = np.stack(stack_list, axis=0)
-        m_count = stack.shape[0]
-        ny, nx, nchan = stack.shape[1:]
-        
-        # Compute PMM only for REFC and APCP channels
-        pmm_results = []
-        valid_channels = []
-        for c in pmm_channels:
-            if c < nchan:
-                channel_stack = np.transpose(stack[:, :, :, c], (1, 2, 0))
-                da = xr.DataArray(
-                    channel_stack,
-                    dims=("latitude", "longitude", "member"),
-                    coords={
-                        "member": np.arange(m_count),
-                    },
-                )
-                pmm_da = compute_PMM(da, method=method)
-                pmm_results.append(pmm_da.values)
-                valid_channels.append(c)
-        
-        if not pmm_results:
-            return np.empty((ny, nx, 0), dtype=stack.dtype), []
-        
-        # Stack PMM results (H, W, num_pmm_channels)
-        pmm_values = np.stack(pmm_results, axis=-1)
-        logger.debug(f"Computed PMM for channels {valid_channels} (REFC/APCP)")
-        return pmm_values, valid_channels
-
-    def _nudge_members_toward_pmm(
-        self,
-        member_outputs: Dict[int, np.ndarray],
-        pmm_values: np.ndarray,
-        pmm_channels: List[int],
-        alpha: float,
-    ) -> Dict[int, np.ndarray]:
-        """Nudge each member towards PMM mean with histogram matching.
-
-        Only applies nudging to REFC and APCP channels; other channels remain unchanged.
-        Blends: blended = alpha * member + (1 - alpha) * PMM
-        Then applies histogram matching: nudged = match_histograms(blended, member)
-        
-        Args:
-            member_outputs: Dict mapping member -> array shape (1, H, W, C) or (H, W, C)
-            pmm_values: PMM values shape (H, W, num_pmm_channels) for REFC/APCP only
-            pmm_channels: List of channel indices corresponding to pmm_values
-            alpha: Blending factor
-        """
-        if not pmm_channels or pmm_values.shape[-1] == 0:
-            # No nudging needed, return original outputs
-            return member_outputs
-        
-        nudged_outputs: Dict[int, np.ndarray] = {}
-        for member, arr in member_outputs.items():
-            if arr.ndim == 4:
-                arr2 = arr[0]
-            else:
-                arr2 = arr
-            
-            # Start with original member data
-            nudged = arr2.copy()
-            
-            # Apply nudging only to REFC and APCP channels
-            for i, c in enumerate(pmm_channels):
-                if c < arr2.shape[-1] and i < pmm_values.shape[-1]:
-                    # Extract single channel
-                    member_channel = arr2[:, :, c]
-                    pmm_channel = pmm_values[:, :, i]
-                    
-                    # Blend with PMM
-                    blended_channel = alpha * member_channel + (1.0 - alpha) * pmm_channel
-                    
-                    # Apply histogram matching to preserve member's distribution
-                    nudged_channel = match_histograms(blended_channel, member_channel, channel_axis=None)
-                    
-                    # Replace channel in output
-                    nudged[:, :, c] = nudged_channel
-            
-            nudged_outputs[member] = nudged[None, ...]
-        
-        logger.debug(f"Applied nudging to channels {pmm_channels} (REFC/APCP)")
-        return nudged_outputs
-
 
 
     def _init_channel_stats(self, ds_norm: xr.Dataset):
@@ -825,7 +694,8 @@ class WeatherForecaster:
         # version masks
         v4 = (time_coord >= np.datetime64("2021-03-23T00")).astype(np.float32)
         v3 = ((time_coord >= np.datetime64("2018-07-12T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
-        # Stack features into shape [B, 6]
+        gfs_v15 = ((time_coord >= np.datetime64("2019-06-01T00")) & (time_coord < np.datetime64("2021-03-23T00"))).astype(np.float32)
+        # Stack features into shape [B, 7]
         features = np.stack([
             np.sin(2 * np.pi * hours / 24.0).astype(np.float32),
             np.cos(2 * np.pi * hours / 24.0).astype(np.float32),
@@ -833,6 +703,7 @@ class WeatherForecaster:
             np.cos(2 * np.pi * doy / 365.0).astype(np.float32),
             v4.astype(np.float32),
             v3.astype(np.float32),
+            gfs_v15.astype(np.float32),
         ], axis=-1)
         return features
 
@@ -842,8 +713,8 @@ class WeatherForecaster:
         def get_encoding_tensor(enc):
             enc = tf.cast(enc, dtype=tf.float32)
             batch_size, lat, lon = tf.shape(enc)[0], self.input_shape[1], self.input_shape[2]
-            enc = tf.reshape(enc, (batch_size, 1, 1, 6))
-            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 6))
+            enc = tf.reshape(enc, (batch_size, 1, 1, 7))
+            enc = tf.broadcast_to(enc, (batch_size, lat, lon, 7))
             return enc
 
         enc = self.compute_time_features(init_times_np, lead_times_np)
@@ -1009,24 +880,29 @@ class WeatherForecaster:
             if self.write_grib2:
                 grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
 
-        build_executor = ThreadPoolExecutor(max_workers=self.batch_size)
-        nc_executor = ThreadPoolExecutor(max_workers=1)
-        grib2_executor = ThreadPoolExecutor(max_workers=1)
+        build_executor = ThreadPoolExecutor(max_workers=len(self.members))
+        nc_executor = ThreadPoolExecutor(max_workers=1) # Serial: HDF5 not thread safe
+        grib2_executor = ThreadPoolExecutor(max_workers=len(self.members)) # Parallel: locked in save_grib2()
         build_futures = []
 
+        # Semaphore to limit pending build tasks and prevent OOM from too many queued forecasts
+        max_pending_builds = 8
+        build_semaphore = threading.Semaphore(max_pending_builds)
+        
+        def submit_with_backpressure(hour: int, data_tensor: tf.Tensor, member: int) -> None:
+            """Submit build task with semaphore-based backpressure control.
+            The tensor->numpy copy happens AFTER semaphore acquisition to prevent
+            memory buildup when the queue is full.
+            """
+            build_semaphore.acquire()  # Block if queue is full
+            data = data_tensor.numpy()  # Copy from GPU to CPU only after semaphore acquired
+            future = build_executor.submit(build_and_submit_hour_outputs, hour, data, member)
+            future.add_done_callback(lambda _: build_semaphore.release())  # Release when done
+            build_futures.append(future)
+
         # Write out hour 0 (f00) products representing the initial state for each member
-        hour0_outputs: Dict[int, np.ndarray] = {
-            member: state_from_hour[member].numpy().copy() for member in self.members
-        }
-        if self.use_nudging:
-            pmm0_values, pmm0_channels = self._compute_pmm_mean(hour0_outputs)
-            nudged_hour0 = self._nudge_members_toward_pmm(hour0_outputs, pmm0_values, pmm0_channels, self.pmm_alpha)
-        else:
-            nudged_hour0 = hour0_outputs
         for member in self.members:
-            build_futures.append(
-                build_executor.submit(build_and_submit_hour_outputs, 0, nudged_hour0[member], member)
-            )
+            submit_with_backpressure(0, state_from_hour[member], member)
 
         # phase shift of GFS forcing input
         num_members = self.num_members
@@ -1070,7 +946,7 @@ class WeatherForecaster:
                 # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
                 X_base = tf.concat(
                     [
-                        X[:, :, :, start_pred_noise:-8],
+                        X[:, :, :, start_pred_noise:-(7 + 2)],
                         date_encoding,
                         X[:, :, :, -2:-1],
                         lead_encoding,
@@ -1080,7 +956,6 @@ class WeatherForecaster:
 
                 # Process members in batches
                 batch_size = self.batch_size
-                hour_member_outputs: Dict[int, np.ndarray] = {}
                 for batch_start in range(0, len(self.members), batch_size):
                     batch_end = min(batch_start + batch_size, len(self.members))
                     batch_members_list = self.members[batch_start:batch_end]
@@ -1129,22 +1004,9 @@ class WeatherForecaster:
                         # state for this member
                         if hour % rollout_hour == 0:
                             state_from_hour[member] = y
-                        hour_member_outputs[member] = y.numpy().copy()
 
-                # Compute PMM mean for this hour and nudge members before writing (if enabled)
-                if self.use_nudging:
-                    pmm_values, pmm_channels = self._compute_pmm_mean(hour_member_outputs)
-                    nudged_outputs = self._nudge_members_toward_pmm(
-                        hour_member_outputs, pmm_values, pmm_channels, self.pmm_alpha
-                    )
-                else:
-                    nudged_outputs = hour_member_outputs
-
-                # Build hourly datasets asynchronously after all members for this hour are computed.
-                for member in self.members:
-                    build_futures.append(
-                        build_executor.submit(build_and_submit_hour_outputs, hour, nudged_outputs[member], member)
-                    )
+                        # Store the output for this hour and member, then submit write task
+                        submit_with_backpressure(hour, y, member)  # Pass tensor, not numpy array
 
         finally:
             # Wait for all background work to complete. Build tasks must drain first so
@@ -1267,8 +1129,6 @@ def parse_arguments():
                         help="Nudge factor toward PMM mean for member outputs (0..1)")
     parser.add_argument("--noise_rho", type=float, default=0.9,
                         help="Noise blend/correlation parameter (0..1)")
-    parser.add_argument("--no_nudging", default=False, action="store_true",
-                        help="Disable nudging (member perturbation toward consensus)")
     parser.add_argument("--no_grib2", default=False, action="store_true",
                         help="Skip GRIB2 output and write NetCDF only (also drops the wgrib2 dependency)")
     parser.add_argument("--nc_complevel", type=int, default=0, choices=range(0, 10),
@@ -1383,7 +1243,7 @@ def main():
 
         nlat = model_input_hrrr.shape[1]
         nlon = model_input_hrrr.shape[2]
-        date_channel = np.ones((1, nlat, nlon, 6), dtype=model_input_hrrr.dtype)
+        date_channel = np.ones((1, nlat, nlon, 7), dtype=model_input_hrrr.dtype)
         lead_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
         step_channel = np.ones((1, nlat, nlon, 1), dtype=model_input_hrrr.dtype)
 
@@ -1422,7 +1282,6 @@ def main():
                                         gfs_channels=gfs_channels,
                                         static_channels=static_channels,
                                         pmm_alpha=args.pmm_alpha,
-                                        use_nudging=not args.no_nudging,
                                         noise_rho=args.noise_rho,
                                         write_grib2=not args.no_grib2,
                                         nc_complevel=args.nc_complevel,
