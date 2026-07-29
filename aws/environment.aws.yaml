@@ -11,6 +11,32 @@
 # TF 2.15 is Keras 2 natively, so the pretrained Keras-2 model loads directly
 # (no tf-keras shim, no TF_USE_LEGACY_KERAS needed as on the arm64 Mac).
 name: hrrrcast
+# Channels: conda-forge first, then defaults. This is the ORIGINAL, known-good
+# configuration -- four successful AWS forecasts used it. Do not "clean it up" by
+# dropping `defaults` without reading the following.
+#
+# Tried and reverted 2026-07-28: removing `defaults`. The motivation was real --
+# pkgs/main serves `mpich=4.3.2=external_0`, a stub build that expects the HOST to
+# provide MPI and ships no libmpi.so.12, and a conda-lock-generated lock file
+# selected it, producing an env that installed cleanly and then died in make_ics
+# with "libmpi.so.12: cannot open shared object file".
+#
+# But dropping `defaults` made the solve intractable rather than merely slower:
+# conda's libmamba solver was still spinning after 14 minutes on a g6e.2xlarge
+# (single-threaded, load 1.00), and conda-lock had already failed to finish the
+# same spec locally after 28 minutes. Suspected cause is the esmf x (mpich |
+# openmpi) variant subtree combined with the CUDA-forced tensorflow branch, which
+# pkgs/main's narrower package set had been pruning by accident.
+#
+# Key distinction: the stub was only ever selected by conda-lock, never by conda's
+# interactive solve, which picks a real mpich build from conda-forge here. So with
+# both channels and no lock file, this configuration is sound.
+#
+# If pinning is revisited, the low-risk route is NOT another channel change but
+# either (a) adopt logs/conda-installed.txt from a successful run as the lock (it
+# is already in conda's @EXPLICIT format), or (b) constrain esmf to an MPI-free
+# build (`esmf=*=nompi*`), since make_bcs regrids in-process with precomputed
+# weights and never needs MPI. Validate with aws/validate_lock.sh either way.
 channels:
   - conda-forge
   - defaults
@@ -40,3 +66,6 @@ dependencies:
   # off-cluster additions
   - wgrib2
   - git-lfs
+  # boto3 backs the per-hour S3 upload in src/s3io.py. Without it s3io falls back
+  # to shelling out to the aws CLI, which works but is slower per file.
+  - boto3

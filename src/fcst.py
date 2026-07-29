@@ -26,6 +26,7 @@ import pandas as pd
 from skimage.exposure import match_histograms
 
 from nc2grib import Netcdf2Grib
+import s3io
 
 # Import custom modules (assuming they exist)
 try:
@@ -213,6 +214,10 @@ class WeatherForecaster:
         use_nudging: bool = True,
         diffusion_sampler: str = "dpmpp-2m",
         noise_rho: float = 0.9,
+        write_grib2: bool = True,
+        nc_complevel: int = 0,
+        nc_least_significant_digit: Optional[int] = None,
+        s3_uploader: Optional["s3io.S3Uploader"] = None,
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
@@ -226,6 +231,10 @@ class WeatherForecaster:
         self.use_nudging = use_nudging and len(members) > 1
         self.diffusion_sampler = diffusion_sampler
         self.noise_rho = noise_rho
+        self.write_grib2 = write_grib2
+        self.nc_complevel = nc_complevel
+        self.nc_least_significant_digit = nc_least_significant_digit
+        self.s3_uploader = s3_uploader
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -665,10 +674,39 @@ class WeatherForecaster:
         if mem_str not in {"avg", "spr"}:
             mem_str = f"m{int(member):02d}"
         nc_path = outdir / f"hrrrcast_{mem_str}_f{hour:02d}.nc"
-        ds_hour.to_netcdf(nc_path)
+
+        # Output is ~1.36 GB per lead hour uncompressed at the full 1059x1799
+        # grid. Measured on a real f01 file from a 12h run:
+        #   complevel=1 -> 879 MB (1.54x), 11.5s;  complevel=6 -> 871 MB (1.56x), 18.8s
+        # Lossless deflate does little on float32 continuous fields, and level 1
+        # captures essentially all of it, so there is no reason to go higher.
+        # Quantizing first is what actually shrinks these files:
+        #   lsd=2 -> 355 MB (3.82x), max abs error 0.0039 in native units
+        #   lsd=3 -> 460 MB (2.95x), max abs error 0.00049
+        # That is lossy, so it is opt-in and off by default.
+        # complevel=0 with no lsd reproduces the original uncompressed behavior.
+        encoding = None
+        if self.nc_complevel > 0 or self.nc_least_significant_digit is not None:
+            per_var = {}
+            if self.nc_complevel > 0:
+                per_var["zlib"] = True
+                per_var["complevel"] = self.nc_complevel
+            if self.nc_least_significant_digit is not None:
+                per_var["least_significant_digit"] = self.nc_least_significant_digit
+            encoding = {name: dict(per_var) for name in ds_hour.data_vars}
+        ds_hour.to_netcdf(nc_path, encoding=encoding)
 
         write_time = time.time() - t0
-        logger.info(f"Wrote NetCDF in {write_time:.3f}s : {nc_path}")
+        size_mb = nc_path.stat().st_size / 1e6
+        logger.info(
+            f"Wrote NetCDF in {write_time:.3f}s ({size_mb:.1f} MB, "
+            f"complevel={self.nc_complevel}, lsd={self.nc_least_significant_digit}) : {nc_path}"
+        )
+
+        # Stream off-box as soon as the file is closed, so a run that dies at
+        # hour 20 still delivered hours 0-19.
+        if self.s3_uploader is not None:
+            self.s3_uploader.upload(nc_path, output_dir)
 
     def write_single_hour_grib2(
         self,
@@ -710,6 +748,15 @@ class WeatherForecaster:
 
         write_time = time.time() - t0
         logger.info(f"Wrote GRIB2 in {write_time:.3f}s : {grib2_path}")
+
+        if self.s3_uploader is not None:
+            self.s3_uploader.upload(grib2_path, output_dir)
+            # nc2grib writes a wgrib2 .idx sidecar next to the GRIB2 when wgrib2
+            # is available. Ship it too; a GRIB2 delivered without its index is a
+            # broken pair for consumers that expect one.
+            idx_path = Path(f"{grib2_path}.idx")
+            if idx_path.is_file():
+                self.s3_uploader.upload(idx_path, output_dir)
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -959,7 +1006,8 @@ class WeatherForecaster:
                 return
 
             nc_executor.submit(write_hour_nc, hour, ds_hour, member)
-            grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
+            if self.write_grib2:
+                grib2_executor.submit(write_hour_grib2, hour, ds_hour, member)
 
         build_executor = ThreadPoolExecutor(max_workers=self.batch_size)
         nc_executor = ThreadPoolExecutor(max_workers=1)
@@ -998,109 +1046,119 @@ class WeatherForecaster:
         rollout_hour = 6
 
         # Process all hourly steps
-        for hour in range(1, target_hour + 1):
-            from_hour = ((hour - 1) // rollout_hour) * rollout_hour
-            step = hour - from_hour
-            logger.info(f"Forecasting hour {hour:2d}: from hour {from_hour:2d} using step {step}h")
+        # The loop is wrapped so a mid-rollout failure still flushes whatever
+        # finished. Otherwise output is silently lost: builder threads submit their
+        # write to nc_executor, and once the main thread has raised, interpreter
+        # shutdown makes ThreadPoolExecutor.submit() fail with "cannot schedule new
+        # futures after interpreter shutdown". Seen on a GPU OOM at hour 1 -- the f00
+        # dataset finished building 2s *after* the exception and was discarded, so a
+        # run with valid hour-0 output delivered nothing. Per-hour streaming is only
+        # worth having if partial results survive a failure.
+        try:
+            for hour in range(1, target_hour + 1):
+                from_hour = ((hour - 1) // rollout_hour) * rollout_hour
+                step = hour - from_hour
+                logger.info(f"Forecasting hour {hour:2d}: from hour {from_hour:2d} using step {step}h")
 
-            # date encoding
-            date_encoding = self.date_encoding_tensor(init_datetime, hour)
-            lead_encoding = tf.fill(
-                tf.concat([tf.shape(X)[:-1], [1]], axis=0),
-                tf.cast(step / 6.0, tf.float32),
-            )
+                # date encoding
+                date_encoding = self.date_encoding_tensor(init_datetime, hour)
+                lead_encoding = tf.fill(
+                    tf.concat([tf.shape(X)[:-1], [1]], axis=0),
+                    tf.cast(step / 6.0, tf.float32),
+                )
 
-            # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
-            X_base = tf.concat(
-                [
-                    X[:, :, :, start_pred_noise:-8],
-                    date_encoding,
-                    X[:, :, :, -2:-1],
-                    lead_encoding,
-                ],
-                axis=-1,
-            )
+                # NOTE: forcing_input no longer includes hour 0, so hour=1 corresponds to index 0
+                X_base = tf.concat(
+                    [
+                        X[:, :, :, start_pred_noise:-8],
+                        date_encoding,
+                        X[:, :, :, -2:-1],
+                        lead_encoding,
+                    ],
+                    axis=-1,
+                )
 
-            # Process members in batches
-            batch_size = self.batch_size
-            hour_member_outputs: Dict[int, np.ndarray] = {}
-            for batch_start in range(0, len(self.members), batch_size):
-                batch_end = min(batch_start + batch_size, len(self.members))
-                batch_members_list = self.members[batch_start:batch_end]
+                # Process members in batches
+                batch_size = self.batch_size
+                hour_member_outputs: Dict[int, np.ndarray] = {}
+                for batch_start in range(0, len(self.members), batch_size):
+                    batch_end = min(batch_start + batch_size, len(self.members))
+                    batch_members_list = self.members[batch_start:batch_end]
                 
-                # Collect inputs for this batch of members
-                batch_X_members = []
+                    # Collect inputs for this batch of members
+                    batch_X_members = []
                 
-                for member in batch_members_list:
-                    # apply phase shift to forcing input index for this member
-                    phase_width = from_hour // 12
-                    phase_shift = round(phase_width * phase_angle[member])
-                    forcing_idx = hour - 1 + phase_shift
-                    forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
+                    for member in batch_members_list:
+                        # apply phase shift to forcing input index for this member
+                        phase_width = from_hour // 12
+                        phase_shift = round(phase_width * phase_angle[member])
+                        forcing_idx = hour - 1 + phase_shift
+                        forcing_idx = np.clip(forcing_idx, 0, forcing_input.shape[0] - 1)
 
-                    # Assemble input for this member
-                    X_member = tf.concat(
-                        [
-                            state_from_hour[member],
-                            forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
-                            X_base,
-                        ],
-                        axis=-1,
+                        # Assemble input for this member
+                        X_member = tf.concat(
+                            [
+                                state_from_hour[member],
+                                forcing_input[forcing_idx:forcing_idx + 1, :, :, :],
+                                X_base,
+                            ],
+                            axis=-1,
+                        )
+                        batch_X_members.append(X_member)
+                
+                    # Stack batch inputs
+                    X_batch = tf.concat(batch_X_members, axis=0)
+                
+                    # Predict next-hour fields for entire batch using hour-specific noise
+                    t0 = time.time()
+                    y_batch = self.predict(model, X_batch, batch_members_list, hour=hour)
+                    predict_time = time.time() - t0
+                    logger.info(f"Hour {hour}, batch {batch_start//batch_size + 1}: predict took {predict_time:.3f}s")
+                
+                    y_batch = tf.clip_by_value(
+                        y_batch,
+                        self.channel_mins[:y_batch.shape[-1]],
+                        self.channel_maxs[:y_batch.shape[-1]]
                     )
-                    batch_X_members.append(X_member)
                 
-                # Stack batch inputs
-                X_batch = tf.concat(batch_X_members, axis=0)
-                
-                # Predict next-hour fields for entire batch using hour-specific noise
-                t0 = time.time()
-                y_batch = self.predict(model, X_batch, batch_members_list, hour=hour)
-                predict_time = time.time() - t0
-                logger.info(f"Hour {hour}, batch {batch_start//batch_size + 1}: predict took {predict_time:.3f}s")
-                
-                y_batch = tf.clip_by_value(
-                    y_batch,
-                    self.channel_mins[:y_batch.shape[-1]],
-                    self.channel_maxs[:y_batch.shape[-1]]
-                )
-                
-                # Process outputs for each member in batch
-                for batch_idx, member in enumerate(batch_members_list):
-                    y = y_batch[batch_idx:batch_idx+1]
+                    # Process outputs for each member in batch
+                    for batch_idx, member in enumerate(batch_members_list):
+                        y = y_batch[batch_idx:batch_idx+1]
                     
-                    # When we reach a 6-hour boundary, update the reference 
-                    # state for this member
-                    if hour % rollout_hour == 0:
-                        state_from_hour[member] = y
-                    hour_member_outputs[member] = y.numpy().copy()
+                        # When we reach a 6-hour boundary, update the reference 
+                        # state for this member
+                        if hour % rollout_hour == 0:
+                            state_from_hour[member] = y
+                        hour_member_outputs[member] = y.numpy().copy()
 
-            # Compute PMM mean for this hour and nudge members before writing (if enabled)
-            if self.use_nudging:
-                pmm_values, pmm_channels = self._compute_pmm_mean(hour_member_outputs)
-                nudged_outputs = self._nudge_members_toward_pmm(
-                    hour_member_outputs, pmm_values, pmm_channels, self.pmm_alpha
-                )
-            else:
-                nudged_outputs = hour_member_outputs
+                # Compute PMM mean for this hour and nudge members before writing (if enabled)
+                if self.use_nudging:
+                    pmm_values, pmm_channels = self._compute_pmm_mean(hour_member_outputs)
+                    nudged_outputs = self._nudge_members_toward_pmm(
+                        hour_member_outputs, pmm_values, pmm_channels, self.pmm_alpha
+                    )
+                else:
+                    nudged_outputs = hour_member_outputs
 
-            # Build hourly datasets asynchronously after all members for this hour are computed.
-            for member in self.members:
-                build_futures.append(
-                    build_executor.submit(build_and_submit_hour_outputs, hour, nudged_outputs[member], member)
-                )
+                # Build hourly datasets asynchronously after all members for this hour are computed.
+                for member in self.members:
+                    build_futures.append(
+                        build_executor.submit(build_and_submit_hour_outputs, hour, nudged_outputs[member], member)
+                    )
 
-        # Wait for all background work to complete. Build tasks must drain first so
-        # they cannot submit into executors that are already shutting down.
-        logger.info(f"Waiting for {len(build_futures)} background build operations to complete...")
-        for future in as_completed(build_futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Background build operation failed: {e}")
-        build_executor.shutdown(wait=True)
-        nc_executor.shutdown(wait=True)
-        grib2_executor.shutdown(wait=True)
-        logger.info("All background output operations completed")
+        finally:
+            # Wait for all background work to complete. Build tasks must drain first so
+            # they cannot submit into executors that are already shutting down.
+            logger.info(f"Waiting for {len(build_futures)} background build operations to complete...")
+            for future in as_completed(build_futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Background build operation failed: {e}")
+            build_executor.shutdown(wait=True)
+            nc_executor.shutdown(wait=True)
+            grib2_executor.shutdown(wait=True)
+            logger.info("All background output operations completed")
 
         logger.info("Autoregressive rollout completed")
 
@@ -1211,8 +1269,60 @@ def parse_arguments():
                         help="Noise blend/correlation parameter (0..1)")
     parser.add_argument("--no_nudging", default=False, action="store_true",
                         help="Disable nudging (member perturbation toward consensus)")
-    
-    return parser.parse_args()
+    parser.add_argument("--no_grib2", default=False, action="store_true",
+                        help="Skip GRIB2 output and write NetCDF only (also drops the wgrib2 dependency)")
+    parser.add_argument("--nc_complevel", type=int, default=0, choices=range(0, 10),
+                        metavar="0-9",
+                        help="NetCDF zlib compression level; 0 writes uncompressed")
+    parser.add_argument("--nc_least_significant_digit", type=int, default=None, metavar="N",
+                        help="Lossy: quantize NetCDF variables to N decimal digits before "
+                             "compression (much smaller files; lsd=2 gives ~3.8x at max abs "
+                             "error 0.004 in native units). Off by default")
+    parser.add_argument("--wait_for_input", default=None, metavar="PATH",
+                        help="Load the model first, then block until PATH exists before reading the "
+                             "preprocessed npz files. Lets the forecast's TensorFlow import and "
+                             "model load (~5 min) overlap with the input-preparation stages")
+    parser.add_argument("--wait_timeout", type=int, default=3600, metavar="SECONDS",
+                        help="Give up waiting for --wait_for_input after this long")
+    parser.add_argument("--s3_output", default=None, metavar="s3://BUCKET/PREFIX",
+                        help="Upload each output file to this S3 prefix as it is written")
+    parser.add_argument("--purge_local", default=False, action="store_true",
+                        help="Delete the local copy after a confirmed S3 upload (requires --s3_output)")
+
+    args = parser.parse_args()
+    if args.purge_local and not args.s3_output:
+        parser.error("--purge_local requires --s3_output (it would otherwise just discard the outputs)")
+    return args
+
+
+def wait_for_input_sentinel(path: str, timeout_s: int) -> None:
+    """Block until `path` appears, or raise once timeout_s has elapsed.
+
+    Used with --wait_for_input so the expensive, data-independent part of startup
+    (TensorFlow import, GPU init, loading the 50M-parameter model: ~5 min measured)
+    can run while the input stages are still preparing the npz files. The caller
+    creates the sentinel only after those stages have succeeded, so its presence
+    means the inputs are complete -- checking for the npz files directly would race
+    against them being written.
+    """
+    waited = 0.0
+    interval = 2.0
+    if os.path.exists(path):
+        logger.info(f"Inputs already present ({path}); no wait needed")
+        return
+    logger.info(f"Model is loaded; waiting for inputs to be ready ({path}, timeout {timeout_s}s)")
+    t0 = time.time()
+    while not os.path.exists(path):
+        if waited >= timeout_s:
+            raise TimeoutError(
+                f"Waited {timeout_s}s for {path} and it never appeared. The input stages "
+                "either failed or are slower than expected."
+            )
+        time.sleep(interval)
+        waited = time.time() - t0
+        if int(waited) % 60 < interval:
+            logger.info(f"still waiting for inputs ({waited:.0f}s elapsed)")
+    logger.info(f"Inputs ready after {waited:.1f}s of waiting")
 
 
 def main():
@@ -1222,6 +1332,10 @@ def main():
     logger = setup_logging(args.log_level)
 
     try:
+        # Build the S3 uploader first: if delivery is configured but broken,
+        # fail now rather than after hours of GPU time.
+        uploader = s3io.make_uploader(args.s3_output, purge_local=args.purge_local)
+
         # Parse members argument (support space/comma separated and ranges like 0-2)
         def expand_member_arg(m):
             result = []
@@ -1244,9 +1358,17 @@ def main():
         filedate_str = f"{init_year}{init_month}{init_day}_{init_hh}"
         hrrr_preprocessed_file = f"{args.base_dir}/{date_str}/hrrr_{filedate_str}.npz"
         gfs_preprocessed_file = f"{args.base_dir}/{date_str}/gfs_{filedate_str}.npz"
+        # Model FIRST, data second. Loading the model needs no input data and takes
+        # ~5 min (TF import, GPU init, 50M-parameter deserialization), so doing it
+        # before the npz reads is what allows --wait_for_input to hide that cost
+        # behind the input-preparation stages. Ordering is otherwise irrelevant.
+        model = ForecastModel(args.model_path)
+
+        if args.wait_for_input:
+            wait_for_input_sentinel(args.wait_for_input, args.wait_timeout)
+
         data_loader_hrrr = PreprocessedDataLoader(hrrr_preprocessed_file)
         data_loader_gfs = PreprocessedDataLoader(gfs_preprocessed_file)
-        model = ForecastModel(args.model_path)
 
         # Precompute model_input ONCE
         model_input_hrrr = data_loader_hrrr.get_model_input()
@@ -1301,7 +1423,11 @@ def main():
                                         static_channels=static_channels,
                                         pmm_alpha=args.pmm_alpha,
                                         use_nudging=not args.no_nudging,
-                                        noise_rho=args.noise_rho)
+                                        noise_rho=args.noise_rho,
+                                        write_grib2=not args.no_grib2,
+                                        nc_complevel=args.nc_complevel,
+                                        nc_least_significant_digit=args.nc_least_significant_digit,
+                                        s3_uploader=uploader)
         run_weather_forecast(
             forecaster, model, args.lead_hours, model_input, args.output_dir
         )

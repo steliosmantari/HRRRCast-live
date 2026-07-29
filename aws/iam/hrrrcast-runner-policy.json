@@ -1,0 +1,51 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCodeAndModel",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::mantari-cast1/hrrrcast/model.keras",
+        "arn:aws:s3:::mantari-cast1/hrrrcast/code/*"
+      ]
+    },
+    {
+      "Sid": "WriteOutputsAndLogs",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": [
+        "arn:aws:s3:::mantari-cast1/hrrrcast/out/*",
+        "arn:aws:s3:::mantari-cast1/hrrrcast/logs/*",
+        "arn:aws:s3:::mantari-cast1/hrrrcast/plots/*"
+      ]
+    },
+    {
+      "Sid": "ListOnlyTheHrrrcastPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::mantari-cast1",
+      "Condition": {
+        "StringLike": { "s3:prefix": "hrrrcast/*" }
+      }
+    },
+    {
+      "Sid": "PublishRunNotifications",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:334566771276:hrrrcast-runs"
+    },
+    {
+      "Sid": "SelfTerminateOnlyHrrrcastInstances",
+      "Effect": "Allow",
+      "Action": "ec2:TerminateInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": { "ec2:ResourceTag/Project": "hrrrcast" }
+      }
+    }
+  ]
+}

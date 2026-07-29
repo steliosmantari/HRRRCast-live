@@ -1,3 +1,16 @@
 __pycache__/
 *.py[cod]
 scripts/
+
+# Per-cycle working directories (<YYYYMMDD>/<HH>/): GRIB2 inputs, npz intermediates,
+# NetCDF output and plots. A single 24-hour cycle is ~9 GB of NetCDF alone, and this
+# checkout has accumulated ~47 GB of them. aws/run_on_ec2.sh excludes the same
+# pattern when packaging the working tree for an instance.
+[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/
+logs/
+*.npz
+*.grib2
+*.grib2.idx
+# xESMF regridding weights: 116 MB, and make_bcs regenerates it when absent.
+gfs_to_hrrr_weights.nc
+.DS_Store
