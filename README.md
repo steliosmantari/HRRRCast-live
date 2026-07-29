@@ -140,7 +140,7 @@ constraints, is in **[aws/README_aws.md](aws/README_aws.md)**. The essentials:
 |---|---|
 | Instance | `g6e.2xlarge` (L40S 48 GB). **24 GB GPUs cannot run this model** |
 | Throughput | ~36 s per lead hour on the L40S, versus ~1,720 s on Apple Silicon CPU |
-| A 24 h forecast | ~50-60 min wall clock, ~9 GB of NetCDF |
+| A 24 h forecast | ~28 min wall clock, ~10.3 GB of NetCDF |
 | Deliverable | NetCDF to S3, one file per lead hour, uploaded as it is written |
 
 ### Pipeline options added for the AWS path

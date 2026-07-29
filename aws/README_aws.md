@@ -13,7 +13,7 @@ Current shape:
 | forecast length | 24 h on AWS (2 h for local Mac testing) |
 | instance | `g6e.2xlarge` (L40S 48 GB); 24 GB GPUs OOM |
 | measured throughput | ~35.5 s per lead hour steady state |
-| a 24 h forecast | ~35 min, ~$1.32, ~9 GB of NetCDF |
+| a 24 h forecast | ~28 min, ~$1.06, ~10.3 GB of NetCDF |
 | deliverable | NetCDF to S3, one file per lead hour |
 | GRIB2 | disabled (`NO_GRIB2=YES`) |
 | plots | separate job, off the critical path (`aws/run_plots.sh`) |
@@ -123,9 +123,9 @@ The abort-multipart rule matters because per-hour NetCDF uploads are multipart
 (~24-42 parts each): a run killed mid-upload can leave parts that are billed but
 invisible to `s3 ls`.
 
-Each 24 h single-member forecast delivers about **8.5 GB** at the current defaults
+Each 24 h single-member forecast delivers about **10.3 GB** at the current defaults
 (`NC_COMPLEVEL=1`, `NC_LSD=2`), so 12 days of daily forecasts is a steady state of
-roughly **100 GB** (~$2.30/month in S3 Standard) rather than unbounded growth.
+roughly **125 GB** (~$2.90/month in S3 Standard) rather than unbounded growth.
 
 ## Running a forecast
 
@@ -459,6 +459,11 @@ Measured on a real f01 file from a 12 h run (1059x1799, 62 variables):
 | `NC_LSD=3` | 460 MB | 2.95x | 8.3 s | max abs 0.00049 |
 | `NC_LSD=2` | 355 MB | 3.82x | 6.7 s | max abs 0.0039 |
 
+The table above was measured on the previous 148-channel network. The current
+upstream network takes 329 input channels, and a lead hour now writes about
+**419 MB** at `NC_COMPLEVEL=1, NC_LSD=2` (f00 is ~226 MB). The ratios are
+unchanged; only the absolute sizes grew ~20%.
+
 Two things to take from this:
 
 - **Lossless deflate barely helps** on float32 continuous fields, and level 1
@@ -467,7 +472,7 @@ Two things to take from this:
   absolute error of 0.0039 in each variable's native units (K, dBZ, mm, ...).
 
 **The AWS default is `NC_COMPLEVEL=1` with `NC_LSD=2`**, so a 24 h single-member
-forecast delivers about **8.5 GB** rather than ~21 GB lossless. `NC_LSD=2` is a
+forecast delivers about **10.3 GB** rather than ~25 GB lossless. `NC_LSD=2` is a
 deliberate, lossy choice: 0.0039 in native units is below the useful precision of
 the forecast, and it also shortens the write, which widens the thin writer-thread
 margin described under [Instance sizing](#instance-sizing-48-gb-vram-is-a-hard-floor).
