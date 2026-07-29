@@ -252,13 +252,17 @@ until `run_cycle.sh` creates a sentinel. The sentinel is created only after ever
 input stage has succeeded, which is why the forecast waits on it rather than on the
 npz files: those appear before they are complete, so watching them would race.
 
-Measured on AWS at 6 lead hours: inputs became ready **69 s before the model
-finished loading**, so the entire input phase cost zero wall clock. A 6-hour
-forecast went from 14.7 to 12.5 min.
+The overlap hides `min(model load, input phase)`, so which side dominates depends on
+forecast length. Both cases were measured on AWS:
 
-The saving is bounded by how long the input phase takes, so it is larger for longer
-forecasts: at 24 lead hours the input phase is ~7 min against a ~4 min model load,
-so the whole startup hides.
+| lead hours | input phase | model load | outcome |
+|---|---|---|---|
+| 6 | ~2.7 min | ~3.8 min | inputs ready **69 s before** the model loaded; input phase costs nothing. Run 14.7 -> 12.5 min |
+| 24 | ~6 min | ~3.7 min | forecast **waited 206 s** for inputs; the model load is fully hidden instead. Run 79.5 -> 28.4 min overall |
+
+So at 6 lead hours the input stages are effectively free and further `make_bcs` work
+would buy nothing, while at the production length of 24 lead hours `make_bcs` is still
+on the critical path and savings there still convert to wall clock.
 
 If any input stage fails, `run_cycle.sh` kills the background forecast via an EXIT
 trap and exits non-zero -- verified by forcing a `get-ics` failure and confirming no

@@ -226,17 +226,26 @@ inference, ~40 min of total instance time.
 |---|---|---|---|
 | boot + code fetch + env + model stage | 11.2 min | **1.7 min** | GPU verify skipped; env installed from the lock (~35 s) instead of solved (~3 min) |
 | get-ics, get-bcs, make-ics | ~3 min | **0** | hidden behind the forecast's model load (`OVERLAP_FCST=YES`) |
-| **make_bcs** | ~42 min | **0** at short leads, 4.2 min at 24 | also hidden while the model loads; see [the README performance notes](../README.md#performance-notes-on-make_bcs) |
-| forecast | ~31 min | ~21 min at 24 leads | 35.6 s per lead hour, unchanged by any of this work |
-| **6 h forecast, measured** | -- | **12.5 min, $0.47** | |
-| **24 h forecast, projected** | **79.5 min, $2.97** | **~26 min, ~$0.97** | not yet measured end to end at 24 leads with the last two changes |
+| **make_bcs** | ~42 min | **4.5 min** at 24 leads, **0** at 6 | partly hidden while the model loads; see [the README performance notes](../README.md#performance-notes-on-make_bcs) |
+| forecast | ~31 min | ~25 min at 24 leads | 36 s per lead hour, unchanged by any of this work |
+| **6 h forecast** | -- | **12.5 min, $0.47** | measured |
+| **24 h forecast** | **79.5 min, $2.97** | **28.4 min, $1.06** | measured, from a clean clone of the commit |
 
 Timings are launch-to-termination, which is the billing basis. Quoting
 launch-to-last-file instead understates a 24-hour run by 6-7 min.
 
-Because the input phase is now hidden behind the model load, **further `make_bcs`
-optimization buys nothing at short lead times** -- it finishes before the model does.
-The remaining cost is the forecast itself.
+**How much of the input phase the overlap hides depends on forecast length**, and it
+is worth being precise because the two cases point in opposite directions. The
+overlap hides `min(model load, input phase)`:
+
+| lead hours | input phase | model load | result |
+|---|---|---|---|
+| 6 | ~2.7 min | ~3.8 min | inputs finished **69 s before** the model loaded: the input phase is free, and further `make_bcs` work buys nothing |
+| 24 | ~6 min | ~3.7 min | the forecast **waited 206 s** for inputs: `make_bcs` is on the critical path, so savings there still convert to wall clock |
+
+So at the production length of 24 lead hours, `make_bcs` optimization is still worth
+doing. An earlier version of this file claimed the opposite, generalizing from the
+6-hour case.
 
 The forecast phase decomposes as 2.1 min TF import plus npz load, 3.4 min
 `load_model`, 2.4 min forecaster init, 2.6 min for hour 1 (including ~2.0 min of
@@ -356,6 +365,16 @@ aws s3 cp s3://<bucket>/hrrrcast/logs/<instance>-stages/conda-installed.txt \
           aws/conda-linux-64.lock
 aws/validate_lock.sh
 ```
+
+### One file the repo deliberately does not carry
+
+`gfs_to_hrrr_weights.nc` (116 MB of xESMF bilinear weights) is not committed, so
+`make_bcs` regenerates it serially at the start of a run. **Measured cost: 33 s**, and
+because instances are ephemeral every run pays it. Staging it to S3 alongside
+`model.keras` would remove that, but 33 s did not seem worth a 116 MB binary in git.
+`run_on_ec2.sh` warns when the file is absent from the checkout being packaged.
+
+## Environment reproducibility, continued
 
 Every run writes `conda list --explicit` to
 `logs/<instance>-stages/conda-installed.txt`, which is already in conda's

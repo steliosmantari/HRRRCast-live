@@ -273,7 +273,7 @@ else
 fi
 
 if ! tar -tzf "$CODE_TARBALL" ./gfs_to_hrrr_weights.nc >/dev/null 2>&1; then
-    printf '\033[1;33mWARNING:\033[0m gfs_to_hrrr_weights.nc is not in this checkout; make_bcs will regenerate it on the instance (slower).\n'
+    printf '\033[1;33mnote:\033[0m gfs_to_hrrr_weights.nc is not in this checkout; make_bcs regenerates it on the instance (measured: 33 s).\n'
 fi
 
 if [ "$DRY_RUN" == "NO" ]; then
