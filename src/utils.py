@@ -2,6 +2,7 @@ import logging
 from dateutil import parser
 from typing import Tuple, Union
 from pathlib import Path
+import numpy as np
 import requests
 import time
 
@@ -55,6 +56,39 @@ def create_output_directory(base_dir: str, date_str: str) -> Path:
     make_directory(out)
     return out
 
+def safe_fill_value(stat_mean: float, stat_std: float, stat_max: float, context: str = "") -> float:
+    """Fill value for NaN/masked entries in a normalized array: the normalized
+    position of the recorded maximum, i.e. (stat_max - stat_mean) / stat_std.
+
+    Falls back to 0.0 (the normalized mean) when stat_max or stat_std is not a
+    finite number -- e.g. the normalization file has no min/max rows, or std is
+    0 -- rather than silently computing NaN/inf and writing that into the
+    model input. A stats file without min/max is a real gap and worth a
+    warning, but it must not turn into a poisoned channel.
+    """
+    if np.isfinite(stat_max) and np.isfinite(stat_std) and stat_std != 0:
+        fillv = (stat_max - stat_mean) / stat_std
+        if np.isfinite(fillv):
+            return fillv
+    logging.getLogger(__name__).warning(
+        f"safe_fill_value: cannot derive a fill value from stats "
+        f"(mean={stat_mean}, std={stat_std}, max={stat_max}){' for ' + context if context else ''}; "
+        "falling back to 0.0 (normalized mean) instead of NaN"
+    )
+    return 0.0
+
+def file_looks_valid(path: Union[str, Path], min_bytes: int = 1024) -> bool:
+    """Cheap sanity check for a downloaded file: exists and is not truncated to
+    near-zero. Not a checksum, but enough to catch the failure mode where a
+    prior crashed run left a 0-byte or partial file that later code would
+    otherwise treat as a valid cache hit forever.
+    """
+    p = Path(path)
+    try:
+        return p.is_file() and p.stat().st_size >= min_bytes
+    except OSError:
+        return False
+
 def download_file_with_retry(url: str, output_path: Union[str, Path], max_retries: int = DEFAULT_MAX_RETRIES,
                               retry_delay: int = DEFAULT_RETRY_DELAY, timeout: int = DEFAULT_TIMEOUT) -> bool:
     """Download a file with retries and basic progress logging.
@@ -66,10 +100,19 @@ def download_file_with_retry(url: str, output_path: Union[str, Path], max_retrie
         retry_delay: Delay between attempts (s)
         timeout: Per-request timeout (s)
     Returns:
-        True on success, False on failure.
+        True on success, False on failure. On any failure the partially
+        written destination file is removed, so a failed attempt never leaves
+        behind a truncated file that a later run could mistake for a good one.
     """
     logger = logging.getLogger(__name__)
     output_path = Path(output_path)
+
+    def _cleanup():
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     for attempt in range(max_retries):
         try:
             logger.info(f"Downloading {url} (attempt {attempt+1}/{max_retries})")
@@ -85,10 +128,18 @@ def download_file_with_retry(url: str, output_path: Union[str, Path], max_retrie
                             downloaded += len(chunk)
                             if downloaded % max((total // 10), 1) == 0:
                                 logger.info(f"Progress: {(downloaded/total)*100:.1f}%")
+            # A server that reports content-length and then serves fewer bytes
+            # (truncated response, connection dropped mid-stream) still reaches
+            # this point without raising; catch it explicitly rather than
+            # returning a short file as a success.
+            if total and downloaded != total:
+                raise requests.exceptions.RequestException(
+                    f"incomplete download: got {downloaded}/{total} bytes")
             logger.info(f"Downloaded {output_path.name}")
             return True
         except requests.exceptions.RequestException as e:
             logger.warning(f"Download failed ({attempt+1}/{max_retries}): {e}")
+            _cleanup()
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
@@ -96,5 +147,6 @@ def download_file_with_retry(url: str, output_path: Union[str, Path], max_retrie
                 return False
         except Exception as e:
             logger.error(f"Unexpected error downloading {url}: {e}")
+            _cleanup()
             return False
     return False
