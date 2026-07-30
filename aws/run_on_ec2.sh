@@ -32,10 +32,23 @@
 #   --region REGION        AWS region                   [us-east-1]
 #   --code-s3 URI          override where the code tarball is staged
 #                          [s3://BUCKET/hrrrcast/code/<sha>-<timestamp>.tar.gz]
+#   --s3-output URI        override where forecast NetCDF/GRIB2 lands
+#                          [s3://BUCKET/hrrrcast/out]. Output paths are keyed only
+#                          by init time (<date>/<hour>/), not by domain -- two
+#                          different experiments sharing a cycle will silently
+#                          collide in the default location. Give an isolated
+#                          prefix (e.g. a per-run-id one) to anything that might
+#                          reuse a cycle another run already touched. See
+#                          aws/deploy_hindcast.sh for an example.
 #   --stage-scheduler      pin the code tarball and a user-data template to S3 for
 #                          the hourly Lambda, then exit without launching. This is
 #                          the deploy step for unattended operation; re-run it to
 #                          roll out a code change. See aws/deploy_scheduler.sh.
+#   --stage-prefix PREFIX  where --stage-scheduler pins the template/params, under
+#                          the bucket [hrrrcast/scheduler]. Override for a second,
+#                          independent scheduler (e.g. a hindcast driver) so it does
+#                          not overwrite the hourly production scheduler's staged
+#                          artifacts. See aws/deploy_hindcast.sh.
 #   --model-s3 URI         model.keras location         [s3://BUCKET/hrrrcast/model.keras]
 #   --nc-complevel N       NetCDF zlib level, 0-9       [1]
 #   --nc-lsd N             LOSSY quantization digits    [2; pass "" for lossless]
@@ -91,6 +104,7 @@ VOLUME_SIZE=200
 REGION="us-east-1"
 MODEL_S3=""
 CODE_S3_OVERRIDE=""
+S3_OUTPUT_OVERRIDE=""
 NC_COMPLEVEL=1
 # NC_LSD=2 quantizes NetCDF to 2 decimal digits before compression. Chosen
 # deliberately: measured on a real f01 file it gives 3.82x (879 MB -> 355 MB, so
@@ -124,6 +138,7 @@ WAIT_CAPACITY_INTERVAL=120
 PREFLIGHT_ONLY="NO"
 # Deploy-time staging for the hourly scheduler (see the --stage-scheduler block).
 STAGE_SCHEDULER="NO"
+STAGE_PREFIX_OVERRIDE=""
 # Command the instance runs once its env is ready. Default reproduces the original
 # behavior; --run-cmd swaps in an experiment (see aws/run_domain_test.sh). Rendered
 # into user_data.sh at @[RUN_CMD], so it must be a single valid shell statement and
@@ -148,6 +163,7 @@ while [ $# -gt 0 ]; do
         --volume-size)         VOLUME_SIZE="$2"; shift 2 ;;
         --region)              REGION="$2"; shift 2 ;;
         --code-s3)             CODE_S3_OVERRIDE="$2"; shift 2 ;;
+        --s3-output)           S3_OUTPUT_OVERRIDE="$2"; shift 2 ;;
         --model-s3)            MODEL_S3="$2"; shift 2 ;;
         --nc-complevel)        NC_COMPLEVEL="$2"; shift 2 ;;
         --nc-lsd)              NC_LSD="$2"; shift 2 ;;
@@ -159,6 +175,7 @@ while [ $# -gt 0 ]; do
         --wait-for-capacity)   WAIT_CAPACITY_MIN="$2"; shift 2 ;;
         --preflight-only)      PREFLIGHT_ONLY="YES"; shift ;;
         --stage-scheduler)     STAGE_SCHEDULER="YES"; shift ;;
+        --stage-prefix)        STAGE_PREFIX_OVERRIDE="$2"; shift 2 ;;
         --run-cmd)             RUN_CMD="$2"; shift 2 ;;
         --no-terminate)        TERMINATE="NO"; shift ;;
         --dry-run)             DRY_RUN="YES"; shift ;;
@@ -196,7 +213,7 @@ fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 CODE_S3="${CODE_S3_OVERRIDE:-s3://${BUCKET}/hrrrcast/code/hrrrcast-${CODE_REF}-${STAMP}.tar.gz}"
 
-S3_OUTPUT="s3://${BUCKET}/hrrrcast/out"
+S3_OUTPUT="${S3_OUTPUT_OVERRIDE:-s3://${BUCKET}/hrrrcast/out}"
 S3_LOGS="s3://${BUCKET}/hrrrcast/logs"
 
 # Latest AWS Deep Learning Base GPU AMI (Ubuntu 22.04) from SSM public parameters.
@@ -391,7 +408,7 @@ fi
 # path identical to the interactive one, including the `bash -n` check below, so
 # a template bug cannot reach the scheduler without also breaking normal runs.
 if [ "$STAGE_SCHEDULER" == "YES" ]; then
-    STAGE_PREFIX="s3://${BUCKET}/hrrrcast/scheduler"
+    STAGE_PREFIX="s3://${BUCKET}/${STAGE_PREFIX_OVERRIDE:-hrrrcast/scheduler}"
     TEMPLATE_FILE="$(mktemp -t hrrrcast-udtemplate)"
     atparse \
         INIT_TIME="__INIT_TIME__" LEAD_HOUR="__LEAD_HOUR__" N_ENSEMBLES="$N_ENSEMBLES" \

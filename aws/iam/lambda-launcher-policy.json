@@ -16,8 +16,33 @@
       "Action": "s3:ListBucket",
       "Resource": "arn:aws:s3:::mantari-cast1",
       "Condition": {
-        "StringLike": { "s3:prefix": "hrrrcast/out/*" }
+        "StringLike": { "s3:prefix": ["hrrrcast/out/*", "hrrrcast/hindcast/*"] }
       }
+    },
+    {
+      "Sid": "ReadWriteHindcastArtifacts",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::mantari-cast1/hrrrcast/hindcast/*"
+    },
+    {
+      "Sid": "SelfDisableHindcastSchedules",
+      "Effect": "Allow",
+      "Action": ["scheduler:GetSchedule", "scheduler:UpdateSchedule"],
+      "Resource": "arn:aws:scheduler:us-east-1:334566771276:schedule/default/hrrrcast-hindcast-*"
+    },
+    {
+      "Sid": "PassSelfForScheduleSelfDisable",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::334566771276:role/hrrrcast-launcher",
+      "Condition": { "StringEquals": { "iam:PassedToService": "scheduler.amazonaws.com" } }
+    },
+    {
+      "Sid": "NotifyHindcastCompletion",
+      "Effect": "Allow",
+      "Action": "sns:Publish",
+      "Resource": "arn:aws:sns:us-east-1:334566771276:hrrrcast-runs"
     },
     {
       "Sid": "InspectInstancesAndTypes",
