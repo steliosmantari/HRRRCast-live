@@ -62,21 +62,23 @@ from crop_domain import size_and_place_bbox
 
 WGRIB2 = os.environ.get("WGRIB2", "wgrib2")
 
-# conda-forge's linux-64 wgrib2 (every build checked: 2.0.5-2 and 2.0.7 alike) is
-# linked against libjasper.so.1, an ABI no longer provided by any jasper this
-# environment can install: pygrib hard-requires jasper>=4.1.0 (a different SONAME
-# entirely), so the environment's own jasper can never satisfy wgrib2, on any
-# version pin. Confirmed by inspecting the actual ELF NEEDED/SONAME entries of both
-# wgrib2 builds and of jasper 1.900.1 (which does provide libjasper.so.1, and needs
-# only libjpeg.so.9 + glibc in turn) -- not by guessing from conda's declared
-# metadata, which doesn't even list jasper as a wgrib2 dependency at all.
+# conda-forge's linux-64 wgrib2 links against a small stack of ABI-old libraries
+# this environment cannot provide: libjasper.so.1 (pygrib hard-requires
+# jasper>=4.1.0, a different SONAME entirely, so no jasper version pin can satisfy
+# both), and transitively libnetcdf.so.13, libhdf5.so.101 and libhdf5_hl.so.100
+# (the environment's netcdf/hdf5 are both several SONAMEs newer). Confirmed by
+# walking the actual ELF NEEDED/SONAME entries with objdump, not by guessing from
+# conda's declared metadata, which does not even list jasper as a wgrib2
+# dependency at all. See aws/wgrib2-compat-linux64/README.md for the full
+# dependency map and how each shim was chosen.
 #
-# Fixed here, not in aws/conda-linux-64.lock: two small shim .so files
-# (aws/wgrib2-compat-linux64/lib/), extracted once from the old jasper/jpeg conda
-# packages and checked in, shipped automatically by the existing code-tarball
-# packaging. LD_LIBRARY_PATH is set ONLY for the wgrib2 subprocess call below, so
-# the shared environment's jasper 4.x -- and pygrib's need for it -- is completely
-# unaffected. A no-op wherever the shim directory doesn't exist (macOS, e.g.).
+# Fixed here, not in aws/conda-linux-64.lock: five small shim .so files
+# (aws/wgrib2-compat-linux64/lib/), extracted once from old conda packages and
+# checked in, shipped automatically by the existing code-tarball packaging.
+# LD_LIBRARY_PATH is set ONLY for the wgrib2 subprocess call below, so the shared
+# environment's jasper/netcdf/hdf5 -- and pygrib's and make_bcs.py's xESMF need
+# for them -- are completely unaffected. A no-op wherever the shim directory
+# doesn't exist (macOS, e.g.).
 _COMPAT_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "aws", "wgrib2-compat-linux64", "lib")
 
