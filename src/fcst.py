@@ -921,8 +921,19 @@ class WeatherForecaster:
             submit_with_backpressure(0, state_from_hour[member], member)
 
         # phase shift of GFS forcing input
+        #
+        # members_sorted must be the ACTUAL member IDs being run, not range(n).
+        # phase_angle is looked up below as phase_angle[member], so keying it by
+        # position broke any run whose member IDs are not 0..n-1: `--members 1` with
+        # num_members=1 built {0: 0.0} and then raised KeyError(1) at the first
+        # rollout hour. Because str(KeyError(1)) is just "1", the log read
+        # "Forecast failed: 1", which looks like an exit status rather than a missing
+        # dict key and is genuinely hard to place.
+        #
+        # self.num_members is still used for the phase spacing, so a member subset of
+        # a larger planned ensemble keeps the spread it would have had.
         num_members = self.num_members
-        members_sorted = list(range(num_members))
+        members_sorted = sorted(self.members)
         half_count = (num_members // 2 - ((num_members + 1) % 2)) # Half count for symmetry
         step = 1.0 / half_count if half_count > 0 else 0.0
         seq = []
@@ -932,7 +943,17 @@ class WeatherForecaster:
         for i in range(half_count):
             seq.append(step * (i + 1))  # Positive phase shifts
             seq.append(-step * (i + 1))  # Negative phase shifts
-        phase_angle = {member: seq[i] for i, member in enumerate(members_sorted)}
+        # Index seq by the member's OWN id, not by its position in this run's subset.
+        # seq has exactly num_members entries by construction, and a member's phase is
+        # a property of the member, so `--members 3` out of 5 must get the same phase
+        # it would get in a full 5-member run. Keying by subset position would make a
+        # single-member rerun silently disagree with the ensemble it came from.
+        if any(m >= num_members for m in members_sorted):
+            raise ValueError(
+                f"member id(s) {[m for m in members_sorted if m >= num_members]} are "
+                f">= --num_members ({num_members}); phase shifts are only defined for "
+                f"ids 0..{num_members - 1}. Raise --num_members to match.")
+        phase_angle = {member: seq[member] for member in members_sorted}
 
         # rollout hour
         rollout_hour = 6
