@@ -26,40 +26,110 @@ HRRRCast is a neural network-based, high‑resolution regional weather forecasti
 
 ## Installation
 
-### Prerequisites
+Pick the platform you are actually running on. The three paths differ in more than
+convenience: the pinned versions are not interchangeable, and the AWS path installs
+nothing locally at all.
 
-- Miniconda3 or Anaconda
-- CUDA-compatible GPU (recommended) or CPU
-- Internet connection (for initial setup)
+| target | command | TensorFlow | notes |
+|---|---|---|---|
+| Linux + NVIDIA GPU, or HPC | `./install_env_ursa.sh` | conda, GPU | `environment.yaml` |
+| macOS, Apple Silicon | `./install_env_mac.sh` | PyPI, CPU only | `environment.mac.yaml` |
+| AWS EC2 | nothing to install | provisioned on the instance | `aws/conda-linux-64.lock` |
 
-### Standard Installation (GPU/CPU with Internet)
+### Prerequisites, all paths
 
-1. Install Miniconda3 if not already installed
-2. Clone this repository and navigate to the project directory
-3. Install the environment using the provided configuration:
+- **Miniconda3 or Anaconda.**
+- **git-lfs.** `net-diffusion/model.keras` is a 194 MiB Git LFS object, and the repo
+  carries a `.gitattributes` so the LFS filter applies. Without git-lfs the file in your
+  checkout is a 134-byte pointer and the model will not load. If you cloned before
+  installing git-lfs, run `git lfs install && git lfs pull`.
+- **Internet access** for the initial environment build. On HPC this must be a login
+  node; see below.
 
-```bash
-conda env create -f environment.yaml
-conda activate hrrrcast
-```
-
-### HPC Installation (No Internet on Compute Nodes)
-
-For HPC environments like Ursa where compute nodes lack internet access:
+### Linux with an NVIDIA GPU, or HPC
 
 ```bash
 ./install_env_ursa.sh
+conda activate hrrrcast
 ```
 
-This script handles CUDA availability simulation on login nodes.
+That is `conda env create -f environment.yaml` with `CONDA_OVERRIDE_CUDA=12.0` set, which
+is what lets the GPU TensorFlow build resolve on a login node that has no GPU of its own.
+Run it there, not on a compute node: compute nodes on Ursa have no internet access.
 
-### Post-Installation Configuration
+Plain `conda env create -f environment.yaml` works on a machine with a real GPU and
+internet.
 
-1. **Configure Environment Paths**: Edit the environment files in the `etc/` directory to match your conda installation directory
+### macOS, Apple Silicon
 
-2. **Download Cartopy Shapefiles** (for plotting functionality):
+```bash
+./install_env_mac.sh          # creates or updates the env, pulls the LFS model, verifies
+conda activate hrrrcast
+```
+
+`ENV_NAME=other ./install_env_mac.sh` uses a different env name; `SKIP_LFS=1` skips the
+model pull if you already have it.
+
+This is **CPU-only, and a development path rather than a production one.** A full-domain
+lead hour takes roughly 1,720 s here against ~35 s on an L40S. Cropping the domain is
+what makes local runs practical: the 1.2% Southern California box measured 18.2 s per
+lead hour. See [README.mac.md](README.mac.md) and
+[docs/subdomain.md](docs/subdomain.md).
+
+It uses a separate spec, `environment.mac.yaml`, because several upstream pins have no
+osx-arm64 build. The substantive differences, each forced by the platform:
+
+- **TensorFlow from PyPI, not conda**, since the upstream `==2.15.0` pin has no arm64
+  build. It is paired with `tf-keras` so the Keras-2-saved model still loads under
+  `TF_USE_LEGACY_KERAS=1`, which the installer sets.
+- **No pyarrow anywhere.** The arm64 build aborts on import, taking down anything that
+  imports pandas, so `pandas<3` and `dask-core` are used to cut both edges that pull it.
+- **numpy<2.5**, because the TF wheel is built against it.
+- **python 3.12**, the only version with arm64 builds across the whole geoscience stack.
+
+### AWS EC2
+
+**Nothing is installed locally.** `aws/run_on_ec2.sh` packages the working tree, launches
+one GPU instance, and the instance builds its own environment from
+`aws/conda-linux-64.lock`, runs the cycle, ships output to S3 and terminates itself.
+
+Local prerequisites are just the AWS CLI and working credentials:
+
+```bash
+aws sts get-caller-identity          # credentials work
+aws/run_on_ec2.sh --bucket YOUR_BUCKET --preflight-only
+```
+
+`--preflight-only` launches nothing and checks the things that otherwise fail after you
+have started paying: caller identity, that the output bucket exists and is readable, that
+the instance profile exists, the G/VT on-demand vCPU quota against the instance type, and
+the Deep Learning Base GPU AMI lookup.
+
+The account-side setup, an S3 bucket, the `hrrrcast-runner` instance profile from
+`aws/iam/`, a G/VT vCPU quota above the default, and the model staged to
+`s3://BUCKET/hrrrcast/model.keras`, is documented with the current state of this
+deployment in **[aws/README_aws.md](aws/README_aws.md)**.
+
+The instance environment is built from a lock file rather than solved, which is both
+faster (~35 s versus ~3 min) and reproducible. `aws/validate_lock.sh` checks it before
+use, because two lock defects have already reached a live instance: one silently
+resolved CPU-only TensorFlow, turning a 24-hour forecast into an 11-hour one, and one
+pulled an MPI stub that failed later in `make_ics`.
+
+### Post-installation configuration
+
+1. **Environment paths.** Edit the files in `etc/` to match your conda installation.
+   `ENVMODE=OPN` selects `etc/env_emc.sh`; anything else selects `etc/env_mac.sh`.
+2. **Cartopy shapefiles**, needed for plotting. `install_env_mac.sh` already does this.
+
    ```bash
    python -c "import cartopy.io.shapereader as shpreader; shpreader.natural_earth()"
+   ```
+
+3. **Verify the model resolved,** rather than discovering a pointer file mid-forecast:
+
+   ```bash
+   ls -l net-diffusion/model.keras     # ~194 MiB, not 134 bytes
    ```
 
 ## Quick Start
