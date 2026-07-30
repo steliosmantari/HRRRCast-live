@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# aws/run_subdomain_forecast.sh — run one HRRRCast forecast on a cropped
+# aws/run_subdomain_forecast.sh: run one HRRRCast forecast on a cropped
 # subdomain, on this instance.
 #
 # Sibling of aws/domain_test.sh, but for production use rather than a

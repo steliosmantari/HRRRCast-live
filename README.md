@@ -142,7 +142,7 @@ environment builds. This section is the map.
 
 ### The main drivers
 
-#### `run_cycle.sh` — one forecast cycle, locally
+#### `run_cycle.sh`: one forecast cycle, locally
 
 Runs the whole pipeline sequentially in one process: `get_ics`, `get_bcs`, `make_ics`,
 `make_bcs`, `fcst`, plots. The non-SLURM counterpart to `submit_all.sh`, with the same
@@ -158,7 +158,7 @@ overridable through environment variables; see the script header for the full li
 `N_GPUS` is accepted only for interface parity with `submit_all.sh` and is ignored: all
 members run in one process locally, because there is no scheduler or GPU array.
 
-#### `submit_all.sh` — one forecast cycle, on SLURM
+#### `submit_all.sh`: one forecast cycle, on SLURM
 
 The same pipeline as a chain of `sbatch` jobs with `afterok` dependencies, rendering the
 `jobs/job-*.sh` templates into `$DATAROOT/logs/`. The forecast and plot stages run as
@@ -169,7 +169,7 @@ design. See [Quick Start](#running-forecasts) above.
 ./submit_all.sh 2026-07-29T00 24 4 2 "$PWD" /scratch/hrrrcast YES
 ```
 
-#### `aws/run_on_ec2.sh` — one forecast on a GPU instance, then walk away
+#### `aws/run_on_ec2.sh`: one forecast on a GPU instance, then walk away
 
 The main AWS entry point. It renders `aws/user_data.sh` and launches one instance, which
 provisions itself, runs the cycle, streams NetCDF to S3 per lead hour, uploads its logs,
@@ -186,7 +186,7 @@ aws/run_on_ec2.sh --bucket mantari-cast1 --lead-hours 24 --wait-for-capacity 20
 `--dry-run` prints exactly what would happen. `--run-cmd` replaces the command the
 instance executes, which is how the subdomain path below works.
 
-#### `aws/run_subdomain_forecast.sh` — one forecast on a cropped box
+#### `aws/run_subdomain_forecast.sh`: one forecast on a cropped box
 
 Not launched directly: it is the command you hand to `run_on_ec2.sh --run-cmd`. It runs
 the input stages once at full domain (regridding is fixed at 1059x1799), crops the
@@ -202,7 +202,7 @@ aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T00 --lead-hours 
 Positional arguments are `INIT_TIME LEAD_HOURS [HEIGHT] [WIDTH] [BBOX] [HALO]`. `BBOX`
 is `N,W,S,E` in degrees and overrides height and width.
 
-#### `aws/run_domain_test.sh` — the full-domain vs subdomain experiment
+#### `aws/run_domain_test.sh`: the full-domain vs subdomain experiment
 
 Launcher for `aws/domain_test.sh`, which runs **three** forecasts on one instance from
 one set of inputs: full domain, the crop, and a second full-domain run with a different
@@ -219,7 +219,7 @@ aws/run_domain_test.sh --bucket mantari-cast1 --init-time 2026-07-29T00 \
 About 60 to 70 minutes and roughly $2.60. Analyse the result locally with
 `src/compare_domains.py`, passing `--ref2-dir` so the noise floor is known.
 
-#### `aws/run_plots.sh` — plot a cycle from S3, separately
+#### `aws/run_plots.sh`: plot a cycle from S3, separately
 
 Plotting is CPU work that produces thousands of PNGs, so it is split out from the GPU
 run: the forecast streams NetCDF to S3 and deletes as it goes, and plots can be made
@@ -233,7 +233,7 @@ aws/run_plots.sh --s3-input s3://mantari-cast1/hrrrcast/out \
 `--variables surface` skips the 20-level pressure fields, roughly 120 of the ~170
 figures per lead hour, so it is much quicker and much smaller.
 
-#### `aws/status.sh` — what is running right now
+#### `aws/status.sh`: what is running right now
 
 Read-only and free. Finds instances by the `Project=hrrrcast` tag that `run_on_ec2.sh`
 sets, so unrelated instances in the account are never shown.
@@ -243,7 +243,7 @@ aws/status.sh --logs   # also print the tail of the newest run log
 aws/status.sh --live   # per instance, over SSM: current command, stage, RSS, GPU state
 ```
 
-#### `aws/pick_cycle.sh` — which cycle an unattended run should produce
+#### `aws/pick_cycle.sh`: which cycle an unattended run should produce
 
 Emits shell-sourceable assignments on stdout and a trace on stderr, and refuses when
 the inputs are not on S3 yet. **The exit codes are the interface:** 0 means a cycle is
@@ -259,7 +259,7 @@ It exists because launching an instance that then discovers a missing GFS file w
 about a dollar and produces a truncated forecast rather than a clean failure. Two HEAD
 requests against the public buckets cost nothing.
 
-#### `aws/deploy_scheduler.sh` — hourly operation
+#### `aws/deploy_scheduler.sh`: hourly operation
 
 Creates or updates the EventBridge Scheduler rule, the Lambda, and the IAM role.
 **Created disabled and in dry-run mode on purpose,** because hourly 24 h forecasts cost

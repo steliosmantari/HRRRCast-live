@@ -184,7 +184,7 @@ measures the crop effect *plus* a different random draw.
 The fix is a yardstick: a second full-domain run with a different member ID. Its
 difference from the first is the model's own stochastic spread.
 
-**Crop/noise ratio: median 1.02, max 1.49** — cropping costs about as much as swapping
+**Crop/noise ratio: median 1.02, max 1.49**, i.e. cropping costs about as much as swapping
 ensemble members.
 
 | variable | random error / noise floor | bias | verdict |
