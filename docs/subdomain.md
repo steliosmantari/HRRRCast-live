@@ -175,11 +175,12 @@ Verified by round-trip: writing GRIB2 from a 155x151 crop and decoding it back w
 grib2io reproduces the NetCDF latitudes and longitudes exactly, and the full-domain
 Section 3 is bit-identical to what the old hardcoded path produced.
 
-Note that GRIB2 is still off by default on AWS: `aws/user_data.sh` exports
-`NO_GRIB2=YES` for every run, full domain included, and that is unchanged. Pass
-`NO_GRIB2=NO` if you want it, bearing in mind it roughly quadruples output volume
-(a 155x151 crop writes 4.1 MB of GRIB2 per lead hour against 5.5 MB of NetCDF, but a
-full-domain hour is 324 MB against 435 MB).
+GRIB2 is nonetheless **off by default everywhere**, on a crop and at full domain
+alike: `fcst.py` needs `--grib2`, and `run_cycle.sh` and
+`aws/run_subdomain_forecast.sh` need `NO_GRIB2=NO`. NetCDF is what everything
+downstream reads, and GRIB2 roughly doubles write time and output volume (a 155x151
+crop writes 4.1 MB of GRIB2 per lead hour against 5.5 MB of NetCDF; a full-domain hour
+is 324 MB against 435 MB). Ask for it only if a consumer needs it.
 
 ## 5. What it costs you
 

@@ -101,7 +101,7 @@ Wall clock       ${ELAPSED_MIN} min
 
 Outputs          ${OUT_LINE:-none}
                  ${OUT_PREFIX}/
-NetCDF settings  complevel=@[NC_COMPLEVEL], least_significant_digit=@[NC_LSD] (GRIB2 disabled)
+NetCDF settings  complevel=@[NC_COMPLEVEL], least_significant_digit=@[NC_LSD] (GRIB2 off, the default)
 GFS cycle lag    @[GFS_MIN_LAG] h (0 = newest cycle)
 
 make_bcs         finished ${BCS_T:-n/a}, ${WORKERS:-?} worker process(es)
@@ -223,6 +223,8 @@ sudo -u "$RUN_USER" -H bash -lc "
     fi
     command -v conda >/dev/null 2>&1 || { echo 'conda still not on PATH' >&2; exit 1; }
     source etc/env_mac.sh
+    # Redundant now that GRIB2 is off by default, kept explicit so an AWS run's
+    # output volume cannot change from under it if the default ever moves.
     export NO_GRIB2=YES
     export NC_COMPLEVEL='@[NC_COMPLEVEL]'
     export S3_OUTPUT='@[S3_OUTPUT]'

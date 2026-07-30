@@ -213,7 +213,7 @@ class WeatherForecaster:
         pmm_alpha: float = 0.65,
         diffusion_sampler: str = "dpmpp-2m",
         noise_rho: float = 0.9,
-        write_grib2: bool = True,
+        write_grib2: bool = False,
         nc_complevel: int = 0,
         nc_least_significant_digit: Optional[int] = None,
         s3_uploader: Optional["s3io.S3Uploader"] = None,
@@ -1080,7 +1080,7 @@ class WeatherForecaster:
             raise RuntimeError(
                 f"{n} GRIB2 file(s) requested by --grib2 were not written "
                 f"(first: {sample}{', ...' if n > 5 else ''}). NetCDF output is "
-                "unaffected; re-run with --no_grib2 if GRIB2 is not required.")
+                "unaffected; drop --grib2 if GRIB2 is not required.")
 
         if self.failed_uploads:
             n = len(self.failed_uploads)
@@ -1197,8 +1197,17 @@ def parse_arguments():
                         help="Nudge factor toward PMM mean for member outputs (0..1)")
     parser.add_argument("--noise_rho", type=float, default=0.9,
                         help="Noise blend/correlation parameter (0..1)")
+    # GRIB2 is opt-in. NetCDF is the deliverable everything downstream reads, GRIB2
+    # roughly doubles write time and output volume, and no consumer in this pipeline
+    # needs it, so paying for it by default is wrong. --no_grib2 is still accepted
+    # because run_cycle.sh, domain_test.sh and other callers pass it; it is now
+    # redundant rather than an error.
+    parser.add_argument("--grib2", default=False, action="store_true",
+                        help="Also write GRIB2 alongside the NetCDF (requires wgrib2; "
+                             "roughly doubles output volume). Off by default")
     parser.add_argument("--no_grib2", default=False, action="store_true",
-                        help="Skip GRIB2 output and write NetCDF only (also drops the wgrib2 dependency)")
+                        help="Deprecated and redundant: GRIB2 is off unless --grib2 is given. "
+                             "Accepted for compatibility; overrides --grib2 if both appear")
     parser.add_argument("--nc_complevel", type=int, default=0, choices=range(0, 10),
                         metavar="0-9",
                         help="NetCDF zlib compression level; 0 writes uncompressed")
@@ -1351,7 +1360,7 @@ def main():
                                         static_channels=static_channels,
                                         pmm_alpha=args.pmm_alpha,
                                         noise_rho=args.noise_rho,
-                                        write_grib2=not args.no_grib2,
+                                        write_grib2=args.grib2 and not args.no_grib2,
                                         nc_complevel=args.nc_complevel,
                                         nc_least_significant_digit=args.nc_least_significant_digit,
                                         s3_uploader=uploader)

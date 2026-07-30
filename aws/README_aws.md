@@ -15,7 +15,7 @@ Current shape:
 | measured throughput | ~35.5 s per lead hour steady state |
 | a 24 h forecast | ~28 min, ~$1.06, ~10.3 GB of NetCDF |
 | deliverable | NetCDF to S3, one file per lead hour |
-| GRIB2 | disabled (`user_data.sh` exports `NO_GRIB2=YES` for every AWS run) |
+| GRIB2 | off by default everywhere; `NO_GRIB2=NO` (or `--grib2`) opts in |
 | plots | separate job, off the critical path (`aws/run_plots.sh`) |
 | notifications | optional email on completion via SNS (`--notify-topic`) |
 | retention | 12-day S3 expiry; the staged model never expires |
