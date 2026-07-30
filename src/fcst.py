@@ -16,7 +16,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -218,6 +218,7 @@ class WeatherForecaster:
         nc_complevel: int = 0,
         nc_least_significant_digit: Optional[int] = None,
         s3_uploader: Optional["s3io.S3Uploader"] = None,
+        output_hours: Optional[Set[int]] = None,
     ):
         self.data_loader_hrrr = data_loader_hrrr
         self.data_loader_gfs = data_loader_gfs
@@ -234,6 +235,11 @@ class WeatherForecaster:
         self.nc_complevel = nc_complevel
         self.nc_least_significant_digit = nc_least_significant_digit
         self.s3_uploader = s3_uploader
+        # None (default) writes/uploads every lead hour, unchanged from before this
+        # option existed. When set, only these hours are built and written; the
+        # rollout itself still computes every hour in between (autoregressive state
+        # depends on it), only the I/O is skipped.
+        self.output_hours = output_hours
         # Names of files S3Uploader gave up on. Appended from the single-threaded
         # nc_executor and the grib2 executor; list.append is atomic under the GIL, and
         # the list is only read after both have been joined.
@@ -913,6 +919,8 @@ class WeatherForecaster:
 
         def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
             """Build the dataset in a worker, then submit both file writes."""
+            if self.output_hours is not None and hour not in self.output_hours:
+                return
             try:
                 ds_hour = self.build_single_hour_dataset(init_datetime, hour, lats, lons, data)
             except Exception as e:
@@ -1272,11 +1280,41 @@ def parse_arguments():
                         help="Upload each output file to this S3 prefix as it is written")
     parser.add_argument("--purge_local", default=False, action="store_true",
                         help="Delete the local copy after a confirmed S3 upload (requires --s3_output)")
+    parser.add_argument("--output_hours", default=None, metavar="SPEC",
+                        help="Only build/write/upload these lead hours; the rollout still computes "
+                             "every hour in between (autoregressive state needs it), only the I/O "
+                             "is skipped. SPEC is 'start:step:end' (e.g. '0:3:24' for f00,f03,...,f24) "
+                             "or an explicit comma list (e.g. '0,6,12,18,24'). Default: every hour")
 
     args = parser.parse_args()
     if args.purge_local and not args.s3_output:
         parser.error("--purge_local requires --s3_output (it would otherwise just discard the outputs)")
+    if args.output_hours is not None:
+        try:
+            args.output_hours = parse_output_hours(args.output_hours)
+        except ValueError as e:
+            parser.error(str(e))
     return args
+
+
+def parse_output_hours(spec: str) -> Set[int]:
+    """Parse --output_hours SPEC into a set of lead hours.
+
+    'start:step:end' (all ints, end inclusive) or a comma list of ints.
+    """
+    if spec.count(":") == 2:
+        start_s, step_s, end_s = spec.split(":")
+        try:
+            start, step, end = int(start_s), int(step_s), int(end_s)
+        except ValueError:
+            raise ValueError(f"--output_hours '{spec}': 'start:step:end' parts must be integers")
+        if step <= 0:
+            raise ValueError(f"--output_hours '{spec}': step must be positive")
+        return set(range(start, end + 1, step))
+    try:
+        return {int(p.strip()) for p in spec.split(",") if p.strip() != ""}
+    except ValueError:
+        raise ValueError(f"--output_hours '{spec}': not a valid 'start:step:end' or comma list")
 
 
 def wait_for_input_sentinel(path: str, timeout_s: int) -> None:
@@ -1410,7 +1448,8 @@ def main():
                                         write_grib2=args.grib2 and not args.no_grib2,
                                         nc_complevel=args.nc_complevel,
                                         nc_least_significant_digit=args.nc_least_significant_digit,
-                                        s3_uploader=uploader)
+                                        s3_uploader=uploader,
+                                        output_hours=args.output_hours)
         run_weather_forecast(
             forecaster, model, args.lead_hours, model_input, args.output_dir
         )

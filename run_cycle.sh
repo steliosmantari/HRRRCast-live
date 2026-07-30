@@ -36,6 +36,11 @@
 #   NC_LSD=           (LOSSY quantization to N decimal digits before compression.
 #                      Measured: N=2 gives 3.8x at max abs error 0.004 in native
 #                      units, N=3 gives 3.0x at 0.0005. Empty = off.)
+#   OUTPUT_HOURS=     (Only build/write/upload these lead hours; the rollout still
+#                      computes every hour in between (autoregressive state needs
+#                      it), only the I/O is skipped. "start:step:end", e.g.
+#                      "0:3:24" for f00,f03,...,f24, or a comma list. Empty = every
+#                      hour, unchanged from before this option existed.)
 #   S3_OUTPUT=        (s3://bucket/prefix; uploads each file as it is written)
 #   PURGE_LOCAL=NO    (YES -> delete local copies after upload; needs S3_OUTPUT.
 #                      Incompatible with RUNPLOT=YES in the same cycle: plotting
@@ -124,6 +129,7 @@ SUB_WIDTH=${SUB_WIDTH:-}
 NO_GRIB2=${NO_GRIB2:-YES}            # NO -> also write GRIB2 (passes --grib2)
 NC_COMPLEVEL=${NC_COMPLEVEL:-0}      # --nc_complevel; 0 = uncompressed (original behavior)
 NC_LSD=${NC_LSD:-}                   # --nc_least_significant_digit (LOSSY; empty = off)
+OUTPUT_HOURS=${OUTPUT_HOURS:-}       # --output_hours (e.g. "0:3:24"); empty = every lead hour
 S3_OUTPUT=${S3_OUTPUT:-}             # s3://bucket/prefix; empty disables upload
 PURGE_LOCAL=${PURGE_LOCAL:-NO}       # YES -> --purge_local (requires S3_OUTPUT)
 OVERLAP_FCST=${OVERLAP_FCST:-NO}     # YES -> start fcst early so its model load
@@ -134,6 +140,7 @@ FCST_FLAGS=()
 [ "$NO_DIFFUSION" == "YES" ] && FCST_FLAGS+=(--no_diffusion)
 [ "$NO_GRIB2"     != "YES" ] && FCST_FLAGS+=(--grib2)
 [ -n "$NC_LSD" ]             && FCST_FLAGS+=(--nc_least_significant_digit "$NC_LSD")
+[ -n "$OUTPUT_HOURS" ]       && FCST_FLAGS+=(--output_hours "$OUTPUT_HOURS")
 [ -n "$S3_OUTPUT" ]          && FCST_FLAGS+=(--s3_output "$S3_OUTPUT")
 [ "$PURGE_LOCAL"  == "YES" ] && FCST_FLAGS+=(--purge_local)
 
