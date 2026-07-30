@@ -544,6 +544,8 @@ the raw logs, the comparison JSON, figures, and the exact code state.
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-29-subdomain/` | 25.2% box: crop/noise ratio ~1, T2M cold bias, halo 20-40 cells, VRAM reading is an allocator artifact |
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-socal-a10g/` | a crop runs on a 24 GB A10G; the 1.2% SoCal box holds; the T2M bias tracks placement, not size |
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-input-stage-crop/` | cropping the RAW inputs (not just the forecast) is 4.6x on `make_ics.py`, 1.5-1.6x on `make_bcs.py`; the LAND/OROG normalization fix this required |
+| `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-gpu-crop-validation/` | raw-input crop validated on real AWS GPU hardware (not just CPU) on two boxes (SoCal, PNW); ~2.1x net cycle speedup, ~9.4x on rollout; `make_bcs.py`'s 1.4x slowdown traced to instance RAM sizing the worker pool, not the crop |
 
 Read the second one's `FINDINGS.md` before the first: it revises two inferences from
-it. The third documents the section 0 driver behavior above.
+it. The third documents the section 0 driver behavior above. The fourth is the first
+of these to actually run on GPU hardware rather than macOS/CPU.
