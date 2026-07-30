@@ -62,6 +62,24 @@ from crop_domain import size_and_place_bbox
 
 WGRIB2 = os.environ.get("WGRIB2", "wgrib2")
 
+# conda-forge's linux-64 wgrib2 (every build checked: 2.0.5-2 and 2.0.7 alike) is
+# linked against libjasper.so.1, an ABI no longer provided by any jasper this
+# environment can install: pygrib hard-requires jasper>=4.1.0 (a different SONAME
+# entirely), so the environment's own jasper can never satisfy wgrib2, on any
+# version pin. Confirmed by inspecting the actual ELF NEEDED/SONAME entries of both
+# wgrib2 builds and of jasper 1.900.1 (which does provide libjasper.so.1, and needs
+# only libjpeg.so.9 + glibc in turn) -- not by guessing from conda's declared
+# metadata, which doesn't even list jasper as a wgrib2 dependency at all.
+#
+# Fixed here, not in aws/conda-linux-64.lock: two small shim .so files
+# (aws/wgrib2-compat-linux64/lib/), extracted once from the old jasper/jpeg conda
+# packages and checked in, shipped automatically by the existing code-tarball
+# packaging. LD_LIBRARY_PATH is set ONLY for the wgrib2 subprocess call below, so
+# the shared environment's jasper 4.x -- and pygrib's need for it -- is completely
+# unaffected. A no-op wherever the shim directory doesn't exist (macOS, e.g.).
+_COMPAT_LIB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "aws", "wgrib2-compat-linux64", "lib")
+
 
 def hrrr_latlons(grib_path: str):
     """Lat/lon of a HRRR GRIB2 file's grid, from its own first message.
@@ -88,8 +106,11 @@ def crop_one(src: str, dst: str, x0: int, y0: int, height: int, width: int) -> N
     """
     ix = f"{x0 + 1}:{x0 + width}"
     iy = f"{y0 + 1}:{y0 + height}"
+    env = dict(os.environ)
+    if os.path.isdir(_COMPAT_LIB):
+        env["LD_LIBRARY_PATH"] = _COMPAT_LIB + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     r = subprocess.run([WGRIB2, src, "-ijsmall_grib", ix, iy, dst],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=env)
     if r.returncode != 0:
         raise RuntimeError(f"wgrib2 failed cropping {src} -> {dst}:\n{r.stderr}")
 
