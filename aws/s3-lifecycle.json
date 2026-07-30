@@ -3,32 +3,62 @@
     {
       "ID": "expire-forecast-netcdf-12d",
       "Status": "Enabled",
-      "Filter": { "Prefix": "hrrrcast/out/" },
-      "Expiration": { "Days": 12 }
+      "Filter": {
+        "Prefix": "hrrrcast/out/"
+      },
+      "Expiration": {
+        "Days": 12
+      }
     },
     {
       "ID": "expire-plots-12d",
       "Status": "Enabled",
-      "Filter": { "Prefix": "hrrrcast/plots/" },
-      "Expiration": { "Days": 12 }
+      "Filter": {
+        "Prefix": "hrrrcast/plots/"
+      },
+      "Expiration": {
+        "Days": 12
+      }
     },
     {
       "ID": "expire-run-logs-12d",
       "Status": "Enabled",
-      "Filter": { "Prefix": "hrrrcast/logs/" },
-      "Expiration": { "Days": 12 }
+      "Filter": {
+        "Prefix": "hrrrcast/logs/"
+      },
+      "Expiration": {
+        "Days": 12
+      }
     },
     {
       "ID": "expire-code-tarballs-12d",
       "Status": "Enabled",
-      "Filter": { "Prefix": "hrrrcast/code/" },
-      "Expiration": { "Days": 12 }
+      "Filter": {
+        "Prefix": "hrrrcast/code/"
+      },
+      "Expiration": {
+        "Days": 12
+      }
+    },
+    {
+      "ID": "expire-domain-test-12d",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "hrrrcast/domain-test/"
+      },
+      "Expiration": {
+        "Days": 12
+      }
     },
     {
       "ID": "abort-incomplete-multipart-uploads-7d",
       "Status": "Enabled",
-      "Filter": { "Prefix": "hrrrcast/" },
-      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+      "Filter": {
+        "Prefix": "hrrrcast/"
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
     }
   ]
 }
