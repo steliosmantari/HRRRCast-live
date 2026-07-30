@@ -99,6 +99,77 @@ def valid_size(h: int, w: int):
     return (not bad), "; ".join(bad)
 
 
+def size_and_place_bbox(lats: np.ndarray, lons: np.ndarray, bbox: str, halo: int):
+    """Size and place a legal box containing `bbox` plus `halo` cells on every side.
+
+    Shared by this script's --bbox path and src/crop_grib2.py, so a GRIB2 crop (sized
+    from a raw grid's own lat/lon) and an npz crop land on the identical box for the
+    same region and halo. Prints the same diagnostics either way and exits(1) on the
+    same errors this script has always raised for a bad box.
+
+    Returns (y0, x0, height, width, meta) where meta is the dict this script has
+    always written to subdomain.json (minus the npz-specific init_time/area_fraction,
+    added by the caller).
+    """
+    H, W = lats.shape
+    try:
+        n_, w_, s_, e_ = [float(v) for v in bbox.split(",")]
+    except ValueError:
+        print("ERROR: --bbox must be N,W,S,E in degrees", file=sys.stderr)
+        sys.exit(1)
+    # The HRRR grid is Lambert conformal, so a lat/lon box is a curved region in
+    # index space. Take the index bounding box of every cell inside the region;
+    # that is a superset of the request, which is what "must contain" needs.
+    inside = ((lats >= s_) & (lats <= n_) & (lons >= w_) & (lons <= e_))
+    if not inside.any():
+        print(f"ERROR: no grid cell falls inside N={n_} W={w_} S={s_} E={e_}. "
+              "Outside the HRRR CONUS domain?", file=sys.stderr)
+        sys.exit(1)
+    iy, ix = np.where(inside)
+    ry0, ry1, rx0, rx1 = iy.min(), iy.max(), ix.min(), ix.max()
+    roi_h, roi_w = ry1 - ry0 + 1, rx1 - rx0 + 1
+
+    want_h, want_w = roi_h + 2 * halo, roi_w + 2 * halo
+    height, width = next_valid_size(want_h, want_w)
+    if height > H or width > W:
+        print(f"ERROR: region plus {halo}-cell halo needs {height}x{width}, "
+              f"larger than the {H}x{W} grid. Reduce --halo.", file=sys.stderr)
+        sys.exit(1)
+    # Centre on the region, then clamp inside the grid without changing the size,
+    # so the legality of (height, width) still holds.
+    y0 = max(0, min((ry0 + ry1) // 2 - height // 2, H - height))
+    x0 = max(0, min((rx0 + rx1) // 2 - width // 2, W - width))
+    y0 = int(max(0, min(y0, H - height)))
+    x0 = int(max(0, min(x0, W - width)))
+
+    print(f"\nregion of interest  N={n_} W={w_} S={s_} E={e_}")
+    print(f"  grid cells inside  {int(inside.sum())}")
+    print(f"  index extent       rows [{ry0}:{ry1+1}]  cols [{rx0}:{rx1+1}]  "
+          f"({roi_h} x {roi_w} cells, {roi_h*3} x {roi_w*3} km)")
+    print(f"  requested halo     {halo} cells ({halo*3} km) per side")
+    print(f"  size needed        {want_h} x {want_w}  ->  legal "
+          f"{height} x {width}")
+    # Report the halo ACTUALLY achieved on each side. Clamping at a grid edge can
+    # silently shrink it, and a thin side is exactly where the crop error lives.
+    halos = {"south": ry0 - y0, "north": (y0 + height - 1) - ry1,
+             "west": rx0 - x0, "east": (x0 + width - 1) - rx1}
+    print("  halo achieved      " + "  ".join(
+        f"{k}={v}" + ("!" if v < halo else "") for k, v in halos.items()))
+    thin = {k: v for k, v in halos.items() if v < halo}
+    if thin:
+        print(f"  NOTE: halo is thinner than requested on {', '.join(thin)} "
+              "(clamped at the grid edge). Error is largest near a crop edge, so "
+              "treat that side's output with more caution.")
+
+    meta = dict(y0=y0, x0=x0, height=height, width=width,
+                full_height=int(H), full_width=int(W),
+                requested_bbox=bbox, requested_halo=halo,
+                sw_lat=float(lats[y0, x0]), sw_lon=float(lons[y0, x0]),
+                ne_lat=float(lats[y0 + height - 1, x0 + width - 1]),
+                ne_lon=float(lons[y0 + height - 1, x0 + width - 1]))
+    return y0, x0, height, width, meta
+
+
 def crop_npz(src: str, dst: str, y0: int, x0: int, h: int, w: int) -> dict:
     """Crop every spatial array in an npz, pass metadata through unchanged.
 
@@ -191,52 +262,7 @@ def main():
     H, W = lats.shape
 
     if a.bbox:
-        try:
-            n_, w_, s_, e_ = [float(v) for v in a.bbox.split(",")]
-        except ValueError:
-            print("ERROR: --bbox must be N,W,S,E in degrees", file=sys.stderr)
-            sys.exit(1)
-        # The HRRR grid is Lambert conformal, so a lat/lon box is a curved region in
-        # index space. Take the index bounding box of every cell inside the region;
-        # that is a superset of the request, which is what "must contain" needs.
-        inside = ((lats >= s_) & (lats <= n_) & (lons >= w_) & (lons <= e_))
-        if not inside.any():
-            print(f"ERROR: no grid cell falls inside N={n_} W={w_} S={s_} E={e_}. "
-                  "Outside the HRRR CONUS domain?", file=sys.stderr)
-            sys.exit(1)
-        iy, ix = np.where(inside)
-        ry0, ry1, rx0, rx1 = iy.min(), iy.max(), ix.min(), ix.max()
-        roi_h, roi_w = ry1 - ry0 + 1, rx1 - rx0 + 1
-
-        want_h, want_w = roi_h + 2 * a.halo, roi_w + 2 * a.halo
-        a.height, a.width = next_valid_size(want_h, want_w)
-        if a.height > H or a.width > W:
-            print(f"ERROR: region plus {a.halo}-cell halo needs {a.height}x{a.width}, "
-                  f"larger than the {H}x{W} grid. Reduce --halo.", file=sys.stderr)
-            sys.exit(1)
-        # Centre on the region, then clamp inside the grid without changing the size,
-        # so the legality of (height, width) still holds.
-        y0 = max(0, min((ry0 + ry1) // 2 - a.height // 2, H - a.height))
-        x0 = max(0, min((rx0 + rx1) // 2 - a.width // 2, W - a.width))
-
-        print(f"\nregion of interest  N={n_} W={w_} S={s_} E={e_}")
-        print(f"  grid cells inside  {int(inside.sum())}")
-        print(f"  index extent       rows [{ry0}:{ry1+1}]  cols [{rx0}:{rx1+1}]  "
-              f"({roi_h} x {roi_w} cells, {roi_h*3} x {roi_w*3} km)")
-        print(f"  requested halo     {a.halo} cells ({a.halo*3} km) per side")
-        print(f"  size needed        {want_h} x {want_w}  ->  legal "
-              f"{a.height} x {a.width}")
-        # Report the halo ACTUALLY achieved on each side. Clamping at a grid edge can
-        # silently shrink it, and a thin side is exactly where the crop error lives.
-        halos = {"south": ry0 - y0, "north": (y0 + a.height - 1) - ry1,
-                 "west": rx0 - x0, "east": (x0 + a.width - 1) - rx1}
-        print("  halo achieved      " + "  ".join(
-            f"{k}={v}" + ("!" if v < a.halo else "") for k, v in halos.items()))
-        thin = {k: v for k, v in halos.items() if v < a.halo}
-        if thin:
-            print(f"  NOTE: halo is thinner than requested on {', '.join(thin)} "
-                  "(clamped at the grid edge). Error is largest near a crop edge, so "
-                  "treat that side's output with more caution.")
+        y0, x0, a.height, a.width, _bbox_meta = size_and_place_bbox(lats, lons, a.bbox, a.halo)
     elif a.centre_lat is not None and a.centre_lon is not None:
         d = (lats - a.centre_lat) ** 2 + (lons - a.centre_lon) ** 2
         cy, cx = np.unravel_index(np.argmin(d), d.shape)
