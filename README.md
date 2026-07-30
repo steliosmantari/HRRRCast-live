@@ -228,10 +228,13 @@ overridable through environment variables; see the script header for the full li
 `N_GPUS` is accepted only for interface parity with `submit_all.sh` and is ignored: all
 members run in one process locally, because there is no scheduler or GPU array.
 
-Set `SUB_BBOX="N,W,S,E"` (with optional `SUB_HALO`, default 40) to run the forecast on a
-cropped subdomain instead of the full 1059x1799 grid. The input stages still run at full
-domain, since the regridding weights are fixed; only inference is cropped, which is
-where the cost is. See [docs/subdomain.md](docs/subdomain.md).
+Set `SUB_BBOX="N,W,S,E"` (with optional `SUB_HALO`, default 40) to run on a cropped
+subdomain instead of the full 1059x1799 grid. This crops the *raw* HRRR GRIB2 before
+`make_ics.py`/`make_bcs.py` run (measured: `make_ics.py` 4.6x faster, `make_bcs.py`
+1.5-1.6x, neither script modified), not just the forecast. GFS itself is not cropped.
+`SUB_HEIGHT`/`SUB_WIDTH` (set together) crop a fixed grid-centred box instead, on the
+older path of cropping the full-domain output afterward. See
+[docs/subdomain.md](docs/subdomain.md).
 
 #### `submit_all.sh`: one forecast cycle, on SLURM
 
@@ -264,13 +267,13 @@ exactly what would happen. `--run-cmd` replaces the command the instance execute
 
 #### `aws/run_subdomain_forecast.sh`: one forecast on a cropped box (superseded)
 
-Superseded by `run_on_ec2.sh --bbox`, which shares one code path with full-domain runs
-and is the only form the hourly scheduler can drive. Kept because the fidelity
-experiments used it. Not launched directly: it is the command you hand to
-`run_on_ec2.sh --run-cmd`. It runs
-the input stages once at full domain (regridding is fixed at 1059x1799), crops the
-`.npz`, and forecasts on the crop only. NetCDF only, because `src/nc2grib.py` hardcodes
-the full grid. See [docs/subdomain.md](docs/subdomain.md).
+Superseded by `run_on_ec2.sh --bbox`, which crops the raw GRIB2 before the input
+stages run instead of after, and is the only form the hourly scheduler can drive.
+Kept because the fidelity experiments used it. Not launched directly: it is the
+command you hand to `run_on_ec2.sh --run-cmd`. It runs the input stages once at
+full domain, crops the resulting `.npz`, and forecasts on the crop only. GRIB2 is
+off by default here as everywhere (`--grib2` to enable; it works on a crop).
+See [docs/subdomain.md](docs/subdomain.md).
 
 ```bash
 aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T00 --lead-hours 24 \
