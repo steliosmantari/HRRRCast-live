@@ -39,22 +39,24 @@ aws/run_on_ec2.sh --bucket mantari-cast1 --preflight-only
 | output bucket | `mantari-cast1`, public access blocked, SSE-S3 default |
 | model staged | `s3://mantari-cast1/hrrrcast/model.keras` (194 MiB) |
 | instance profile | `hrrrcast-runner` (created; see below) |
-| G/VT on-demand vCPU quota | 8; **increase to 32 requested** 2026-07-28 (case 178525039300546) |
+| G/VT on-demand vCPU quota | **32** (case 178525039300546 granted; confirmed by preflight 2026-07-29) |
 
-**The vCPU quota of 8 is a live constraint**, not a footnote. The working instance
-type, `g6e.2xlarge`, needs exactly 8 vCPU, so at the current quota you can run
-**one forecast at a time and nothing else**. Two consequences seen in practice:
+**The quota was 8 until 2026-07-29 and is now 32**, so four `g6e.2xlarge` (8 vCPU
+each) can run concurrently. The constraint that remains is capacity, not quota:
 
-- A **shutting-down** instance still holds its vCPUs, so relaunching immediately
-  after a run fails with `VcpuLimitExceeded`. Wait for `terminated`.
-- The obvious workaround, `g6e.xlarge` (4 vCPU, same 48 GB L40S), had
-  `InsufficientInstanceCapacity` in **all four** AZs offering it, so you cannot
-  rely on it to create headroom.
+- A **shutting-down** instance still holds its vCPUs. Preflight refuses in that
+  state rather than letting `run-instances` fail with `VcpuLimitExceeded`; wait for
+  `terminated`. Observed taking about 4 minutes.
+- **`g6e.2xlarge` capacity is genuinely scarce.** On 2026-07-29 it returned
+  `InsufficientInstanceCapacity` in *every* us-east-1 AZ on two separate occasions,
+  and one launch succeeded only on its fifth placement attempt (EC2-chosen, 1d, 1b,
+  1a all refused; 1c worked). Always pass `--wait-for-capacity`.
+- `g6e.xlarge` (4 vCPU, same 48 GB L40S) had no capacity in any of the four AZs
+  offering it, so it is not a reliable way to create headroom.
 
 `--preflight-only` checks both the quota and in-flight instances and refuses with a
-clear message rather than letting `run-instances` fail opaquely. An increase to 32
-on `L-DB2E81BA` is pending (case 178525039300546); once granted it buys both
-concurrency and the freedom to fall back to larger types when capacity is short.
+clear message rather than letting `run-instances` fail opaquely. With 32 vCPU on `L-DB2E81BA` there is now room to fall back to a larger type when
+capacity is short, which given the scarcity above is the more useful freedom.
 
 Do not reuse the pre-existing `hrrrcast-ssm` profile: it carries only
 `AmazonSSMManagedInstanceCore`, so a run using it could neither fetch the model
@@ -67,7 +69,8 @@ Policies are checked in under [iam/](iam/) so they can be reviewed and reapplied
 [hrrrcast-runner-policy.json](iam/hrrrcast-runner-policy.json). Scoped to:
 
 - `s3:GetObject` on the model and the `hrrrcast/code/*` prefix only
-- `s3:PutObject` on `hrrrcast/out/*`, `hrrrcast/logs/*`, `hrrrcast/plots/*` only
+- `s3:PutObject` on `hrrrcast/out/*`, `hrrrcast/logs/*`, `hrrrcast/plots/*` and
+  `hrrrcast/domain-test/*` only
 - `s3:ListBucket` restricted by condition to the `hrrrcast/*` prefix
 - `ec2:TerminateInstances` restricted by condition to instances tagged
   `Project=hrrrcast`, which the launcher sets. The instance can end its own run
@@ -111,8 +114,54 @@ aws s3api put-bucket-lifecycle-configuration --bucket mantari-cast1 \
 | `hrrrcast/plots/` | 12 days |
 | `hrrrcast/logs/` | 12 days |
 | `hrrrcast/code/` (build tarballs) | 12 days |
+| `hrrrcast/domain-test/` | 12 days |
+| `hrrrcast/experiments/` | **never expires** (curated results) |
 | `hrrrcast/model.keras` | **never expires** |
 | incomplete multipart uploads | aborted after 7 days |
+
+`hrrrcast/domain-test/` holds raw subdomain-experiment output, three 24 h forecasts per
+run at roughly **20 GB per cycle**, 94% of it the two full-domain runs. Two experiments
+had accumulated 43.4 GiB before the 12-day rule was added.
+
+The rule is safe to apply because the **analysis subset is promoted out of the way
+first**. `compare_domains.py` needs only the leads actually compared, so for each
+experiment those files plus the crop definition are copied into
+`hrrrcast/experiments/<name>/netcdf/`, which no rule matches:
+
+```
+hrrrcast/experiments/<name>/netcdf/
+    full/hrrrcast_m00_f{01,06,12,24}.nc      <- reference
+    sub/hrrrcast_m00_f{01,06,12,24}.nc       <- the crop
+    full-m1/hrrrcast_m01_f{01,06,12,24}.nc   <- the noise yardstick
+    subdomain.json                           <- required to align the crop
+```
+
+That is ~3.5 GiB per experiment, and it keeps every published number independently
+re-verifiable after the raw prefix expires. What is lost is the ability to analyse a
+*different* lead hour later; that costs a fresh run (~$2.30 to $2.80 per cycle), which
+is a deliberate trade against ~$1/month of storage per two experiments.
+
+**Promote before you expire.** Run this for a new experiment, verify it, and only then
+rely on the rule:
+
+```bash
+SRC=s3://mantari-cast1/hrrrcast/domain-test/<cycle>
+DST=s3://mantari-cast1/hrrrcast/experiments/<name>/netcdf
+for L in 01 06 12 24; do
+  aws s3 cp $SRC/full/<YYYYMMDD>/<HH>/hrrrcast_m00_f$L.nc    $DST/full/hrrrcast_m00_f$L.nc
+  aws s3 cp $SRC/sub/<YYYYMMDD>/<HH>/hrrrcast_m00_f$L.nc     $DST/sub/hrrrcast_m00_f$L.nc
+  aws s3 cp $SRC/full-m1/<YYYYMMDD>/<HH>/hrrrcast_m01_f$L.nc $DST/full-m1/hrrrcast_m01_f$L.nc
+done
+aws s3 cp $SRC/subdomain.json $DST/subdomain.json
+```
+
+Copies are server-side, so nothing transits your machine. Verify with `head-object` on
+each pair and compare **size and ETag** before trusting the rule to delete the source.
+To reclaim the space immediately rather than in 12 days:
+
+```bash
+aws s3 rm --recursive s3://mantari-cast1/hrrrcast/domain-test/
+```
 
 **The rules are prefix-scoped specifically so `model.keras` survives.** A
 whole-bucket expiry would delete it, and every future run stages the model from
@@ -186,12 +235,15 @@ To follow along live, launch with `--key-name <key> --no-terminate` and tail
 afterwards; `--no-terminate` disables the self-cleanup that normally guarantees
 you are not paying for an idle GPU.
 
-### Instance sizing: 48 GB VRAM is a hard floor
+### Instance sizing: 48 GB VRAM is a hard floor at full domain
+
+(At full domain. On a crop it is untested; see [Subdomain inference](#subdomain-inference-cheaper-tested).)
 
 Default is `g6e.2xlarge` (1x **L40S 48 GB**, 8 vCPU, 64 GiB host RAM, 450 GB NVMe). This is
 measured, not assumed.
 
-**24 GB GPUs cannot run this model.** A `g5.2xlarge` (A10G 24 GB) exhausted all
+**24 GB GPUs cannot run this model at full domain** (they can on a crop; see
+[Subdomain inference](#subdomain-inference-cheaper-tested)). A `g5.2xlarge` (A10G 24 GB) exhausted all
 20,795 MB usable and died in the forecast stage:
 
 ```
@@ -486,25 +538,253 @@ not on the critical path until it exceeds the per-hour inference time. That is w
 `NC_COMPLEVEL` is a knob rather than hardcoded: if the writer thread ever becomes
 the bottleneck, drop it to 0.
 
+## Hourly operation (EventBridge Scheduler → Lambda)
+
+```
+EventBridge Scheduler  cron(5 * * * ? *)  UTC
+    └─> Lambda  hrrrcast-hourly-launcher        (aws/lambda/handler.py)
+          ├─ reads s3://BUCKET/hrrrcast/scheduler/{launch-params.json,user_data.template}
+          ├─ refuses if a run is in flight, the cycle is already produced,
+          │  the inputs are incomplete, or the vCPU quota is full
+          └─> RunInstances: one g6e.2xlarge, self-terminating
+```
+
+### Why the pipeline needs a GFS lag to run hourly
+
+Measured publication latency on the public buckets: the HRRR analysis for hour H
+appears at about **H+0:51**, but a GFS cycle does not finish publishing its
+`f000`–`f036` block until about **cycle+4:00** (one cycle measured directly at
++3:41). So the newest GFS cycle does not exist when the HRRR analysis lands.
+
+Enumerated over a full day, with the default rule `cycle = floor(H/6)*6`:
+
+| | blocked hours | zero-margin hours | GFS age | steps used |
+|---|---|---|---|---|
+| `GFS_MIN_LAG=0` (default) | **12 of 24** | 4 more (03/09/15/21Z) | 1–6 h | f001–f029 |
+| `GFS_MIN_LAG=4` | **0** | 0 (min margin +1 h) | 4–10 h | f005–f033 |
+
+`--gfs-min-lag 4` shifts cycle selection back before rounding down, trading GFS
+freshness for a launch slot in every hour. It keeps the initial condition at a
+uniform ~1 h old, which is what a rapid-refresh product is judged on.
+
+**This is a real distribution shift.** f005–f033 extends past the f001–f029 range
+the network trained on, and the top of that range is reached on three of every six
+hours. It has not been measured against a matched `lag=0` run. Do that before
+treating hourly output as equivalent to on-demand output.
+
+The default stays `0` everywhere except `pick_cycle.sh`, because on-demand and
+retrospective runs have all the data published and should use the freshest cycle.
+A consequence worth stating plainly: **a retrospective run is not a valid
+verification proxy for the hourly product**, since it gets systematically better
+forcing. Pass `--gfs-min-lag 4` for anything meant to characterize hourly skill.
+
+### Deploying it
+
+The schedule is created **DISABLED**, and the Lambda starts in **dry-run**, so
+nothing spends money until you say so twice.
+
+```bash
+# 1. pin the code and a user-data template to S3 (the deploy step)
+GFS_MIN_LAG=4 aws/run_on_ec2.sh --bucket mantari-cast1 --stage-scheduler
+
+# 2. create role, Lambda and schedule; disabled, dry-run
+aws/deploy_scheduler.sh --bucket mantari-cast1
+
+# 3. one manual invocation, see what it would pick
+aws/deploy_scheduler.sh --bucket mantari-cast1 --invoke-once
+
+# 4. hourly, still dry-run: read a day of logs and check the cycle choices
+aws/deploy_scheduler.sh --bucket mantari-cast1 --enable
+
+# 5. actually launch instances
+aws/deploy_scheduler.sh --bucket mantari-cast1 --enable --live
+
+# stop
+aws/deploy_scheduler.sh --bucket mantari-cast1 --disable
+```
+
+Re-running step 1 then step 2 is how a code change rolls out; the Lambda reads
+both S3 objects on every invocation. `CodeRef` is tagged on each instance and
+appears in the notification email, so a stale deploy is visible.
+
+Why `HH:05`: the analysis lands at about `H+0:51`, so a tick at `H+1:05` leaves
+roughly 14 minutes of slack for a late file before the Lambda falls back an hour.
+
+### Cost, 1 member, on-demand
+
+| lead | min/run | $/run | $/month | storage at 12-day retention |
+|---|---|---|---|---|
+| 24 h | 32 | $1.20 | **$875** | 2.4 TB, ~$56/mo |
+| 12 h | 19 | $0.72 | $523 | 1.2 TB, ~$28/mo |
+| 6 h | 16 | $0.61 | $442 | 0.6 TB, ~$15/mo |
+
+Spot at the usual ~65% discount takes the 24 h case to roughly **$306/month**,
+and the ~28 min of slack per hour absorbs one interruption and retry. That is a
+larger lever than any remaining code optimization.
+
+Two decisions to make before enabling: whether every hourly cycle needs 12 days
+of retention or only the synoptic ones, and whether to wire the SNS topic, since
+under hourly operation a silently skipped hour is invisible without it.
+
+### What is deliberately not there
+
+No Step Functions, no Batch, no spot handling, no ensemble fan-out. The Lambda
+launches one instance and forgets it; the instance always self-terminates via its
+EXIT trap. If an hour fails, the next hour simply runs. `MaximumRetryAttempts` is
+0 on the schedule target for the same reason: a retry would land on the same
+missing data, and `pick_cycle`'s lookback already self-heals a missed tick.
+
+## Subdomain inference (cheaper, tested)
+
+Cropping the domain cuts cost, because the cost of a step scales with `H*W`. Measured
+on 2026-07-29 17Z at 24 h lead, a 25.2% crop (531x903) against a matched full-domain
+run on the same instance with bit-identical inputs:
+
+| | full | sub (25.2%) | ratio |
+|---|---|---|---|
+| wall clock, 24 h | 1308 s | **543 s** | 2.4x |
+| inference only (less ~210 s model load) | 45.8 s/h | **13.9 s/h** | **3.3x** |
+| NetCDF write, mean | 20.0 s | 4.75 s | 4.2x |
+| total output | 10.9 GB | 2.77 GB | 3.9x |
+
+**Fidelity holds.** Crop/noise ratio median 1.02, max 1.49, i.e. cropping costs about
+as much as swapping ensemble members. Surface pressure, 10 m wind, reflectivity and
+precipitation are indistinguishable from the model's own spread. **2 m temperature
+carries a systematic cold bias of about 0.5 to 1.1 K**, most plausibly from the 39
+squeeze-excitation blocks whose `GlobalAveragePooling2D` gating changes when the
+domain mean changes. It is a bias, not lost skill, so calibration can remove it.
+
+A second test on a much smaller, real box (Southern California, 155x151, **1.2%** of
+CONUS) confirms this and revises one point. Ratio median 1.10, max 1.95, so a 20x
+smaller box costs only slightly more. But the T2M bias did **not** grow with the
+smaller box: it fell to -0.11 to +0.20 K and changed sign. **The bias tracks where the
+box sits relative to the CONUS mean, not how small it is**, so it has to be measured
+per box rather than predicted from area. On that box the variable to watch is 10 m wind
+at f24 instead: ratio 1.50, bias -1.22 m/s, with the crop-versus-full difference as
+large as the field's own spatial spread. Inference scaled 9.8x on an 80x area
+reduction, sublinear because per-call overhead starts to dominate at that size.
+
+Two things to know before using this:
+
+- **The size is constrained**: `H % 8 == 3` and `W % 8 == 7`, because the model bakes a
+  fixed reflect-padding. A wrong size misaligns the UNet skips and may fail silently
+  rather than loudly. `512x512` is not legal.
+- **A crop runs on a 24 GB A10G. Measured, not assumed.** A 155x151 crop completed a
+  24 h forecast on `g5.2xlarge`, status `success`, zero OOM, inside the 20,795 MB
+  TensorFlow reports usable. Ignore the 43953 MiB peak the runs report: every run
+  reports it, full domain and 1.2% crop alike, median equal to max, because
+  `fcst.py` sets `set_jit(True)` and XLA claims a large fixed pool regardless of the
+  work. **Do not size hardware from that number or from `nvidia-smi`.**
+
+`g5.2xlarge` costs $1.21/h against $2.24/h, so a ~19 min subdomain run is about $0.38
+rather than $0.49, and hourly 24 h operation drops from about $875/month to roughly
+$150-200/month before spot, with storage from 2.4 TB to 0.6 TB. There is an
+availability argument too: `g6e.2xlarge` returned `InsufficientInstanceCapacity` in
+every us-east-1 AZ twice during this work, and one launch only succeeded on its fifth
+placement attempt, while both `g5.2xlarge` launches succeeded first try. `g5` pools are
+much deeper.
+
+Note that `run_on_ec2.sh` still defaults to `g6e.2xlarge`. A subdomain run needs
+`--instance-type g5.2xlarge` passed explicitly, or it silently pays the L40S rate.
+
+Full instructions, including how to place the box and how much halo to leave, are in
+**[../docs/subdomain.md](../docs/subdomain.md)**. To re-verify a different box or
+season:
+
+```bash
+aws/run_domain_test.sh --bucket mantari-cast1 --lead-hours 24   # ~75 min, ~$2.80
+```
+
+That runs three forecasts on one instance: full domain, the crop, and a second
+full-domain run with a different member ID. The third is not padding. Diffusion noise
+is drawn with `stateless_normal(shape, seed=[member, hour])`, so the draw depends on
+the tensor SHAPE and a cropped run gets a different realization no matter what.
+Without the second full-domain run as a noise floor, a full-vs-crop difference cannot
+be attributed to cropping at all.
+
+### How to run a subdomain forecast
+
+`run_on_ec2.sh` has **no** subdomain flags of its own. The crop is selected by the
+command it runs, so you pass it through `--run-cmd`, pointing at
+[run_subdomain_forecast.sh](run_subdomain_forecast.sh):
+
+```bash
+aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T17 \
+    --lead-hours 24 \
+    --run-cmd "./aws/run_subdomain_forecast.sh '2026-07-29T17' '24' '' '' '35.0,-118.77,33.25,-117.0' '40'"
+```
+
+The positional arguments to `run_subdomain_forecast.sh` are
+`INIT_TIME LEAD_HOURS [HEIGHT] [WIDTH] [BBOX] [HALO]`. `BBOX` is `N,W,S,E` in
+degrees and overrides `HEIGHT`/`WIDTH`: the script sizes and places a legal box that
+contains that region plus `HALO` cells on every side. Leave `BBOX` empty and pass
+`HEIGHT WIDTH` instead to crop a fixed-size box centred on the CONUS grid.
+
+`--init-time` and `--lead-hours` still matter on the launcher: they set the cycle the
+bootstrap stages inputs for and the S3 output prefix. Keep them consistent with the
+positional arguments in `--run-cmd`.
+
+Everything else in `run_on_ec2.sh` behaves normally, including `--instance-type`,
+`--dry-run`, `--preflight-only`, `--no-terminate` and `--notify-topic`. The bootstrap
+exports `DATAROOT`, `S3_OUTPUT`, `NC_COMPLEVEL`, `NC_LSD`, `GFS_MIN_LAG` and
+`PURGE_LOCAL`, and the script reads all of them, so a subdomain run ships to S3 and
+self-terminates like any other.
+
+Check the box before paying for an instance:
+
+```bash
+python3 src/crop_domain.py --in-dir . --out-dir . --init-time 2026-07-29T17 \
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --dry-run
+```
+
+That prints the chosen size, its origin in the full grid, the achieved halo on each
+side, and the fraction of CONUS area. For the Southern California box above it
+returns 155x151 at `y0=359, x0=202`, 1.2% of CONUS, halo 40/40/42/42.
+
+**How much halo.** From the measured error-versus-distance profile, T2M RMSE against
+the full-domain run falls from 1.038 K in the outermost 5 cells to 0.707 K in the deep
+interior at f01 (2.540 to 1.458 K at f06), and is flat past roughly 20 to 40 cells.
+So **20 to 40 cells (60 to 120 km) of halo** captures nearly all of the available
+improvement; 40 is the default. More halo buys very little, and it cannot remove the
+T2M cold bias at all, because that comes from the changed domain mean feeding 39
+squeeze-excitation blocks rather than from the boundary.
+
+Two limits of this path as it stands:
+
+- **GRIB2 output does not work on a crop.** `src/nc2grib.py` hardcodes the HRRR grid
+  as `nx=1799, ny=1059`, so the script defaults to `NO_GRIB2=YES`. NetCDF only.
+- **The input stages always run at full domain.** The regridding weights are fixed at
+  1059x1799, so `get_*`/`make_*` cost the same as a full run (about 417 s measured).
+  At a small crop that fixed cost, plus a ~210 s model load, dominates the wall clock,
+  and inference is only a few percent of it. Cropping the input stage, or a baked AMI,
+  is where the next saving is.
+
 ## What this does not do
 
-Deliberately absent, because on-demand single-member runs do not need it:
-scheduled triggers, AWS Batch or Step Functions, spot instances with
+Deliberately absent: AWS Batch or Step Functions, spot instances with
 checkpointing, ensemble fan-out, and a baked AMI. Each becomes worth adding at a
 specific point:
 
 - **More members** is the trigger for Batch (fan-out) and spot (cost).
 - **Frequent runs** is the trigger for a baked AMI; every launch currently
-  rebuilds the conda env from `environment.aws.yaml`, which takes minutes. The
-  env is also unpinned apart from TensorFlow, so a rebuild months from now may
-  not reproduce.
-- **Recurring cadence** is the trigger for EventBridge.
+  rebuilds the conda env from the lock file, which takes ~1.7 min.
 
 ## Related files
 
 | file | role |
 |---|---|
-| [run_on_ec2.sh](run_on_ec2.sh) | launcher; packages code, launches, reports |
+| [run_on_ec2.sh](run_on_ec2.sh) | launcher; packages code, launches, reports. `--stage-scheduler` is the deploy step for hourly |
+| [pick_cycle.sh](pick_cycle.sh) | picks a cycle, probes every input file, checks idempotency; exit 3 = nothing to do |
+| [deploy_scheduler.sh](deploy_scheduler.sh) | creates/updates the role, Lambda and EventBridge schedule (disabled + dry-run by default) |
+| [lambda/handler.py](lambda/handler.py) | the hourly launcher itself |
+| [iam/lambda-launcher-policy.json](iam/lambda-launcher-policy.json) | launcher permissions; `RunInstances` split across resource types on purpose |
+| [../src/gfs_cycle.py](../src/gfs_cycle.py) | GFS cycle rule + input manifest, stdlib-only so Lambda can import it |
+| [../src/crop_domain.py](../src/crop_domain.py) | crops IC/BC npz to a subdomain; enforces the `H%8==3, W%8==7` rule |
+| [../src/compare_domains.py](../src/compare_domains.py) | full vs subdomain fidelity, against a stochastic-noise yardstick |
+| [run_subdomain_forecast.sh](run_subdomain_forecast.sh) | one production forecast on a cropped box; drive it with `run_on_ec2.sh --run-cmd` |
+| [domain_test.sh](domain_test.sh) | three-forecast subdomain experiment, run on the instance |
+| [run_domain_test.sh](run_domain_test.sh) | launcher for the subdomain experiment |
+| [../docs/subdomain.md](../docs/subdomain.md) | how to run on a subdomain, and what it costs |
 | [user_data.sh](user_data.sh) | instance bootstrap template; always self-terminates |
 | [setup_gpu.sh](setup_gpu.sh) | provisions the conda env, stages the model, verifies GPU |
 | [run_plots.sh](run_plots.sh) | independent plot job reading NetCDF from S3 |

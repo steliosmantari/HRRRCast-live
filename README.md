@@ -6,6 +6,7 @@ HRRRCast is a neural network-based, high‑resolution regional weather forecasti
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Scripts and entry points](#scripts-and-entry-points)
 - [Running on AWS](#running-on-aws)
 - [Ensemble and PMM Support](#ensemble-and-pmm-support)
 - [End‑to‑End Pipeline](#end-to-end-pipeline)
@@ -68,14 +69,25 @@ This script handles CUDA availability simulation on login nodes.
 Use the provided submission script to run forecasts:
 
 ```bash
-./submit_all.sh <INIT_TIME> <LEAD_HOUR> <N_ENSEMBLES> <N_GPUS> <ACCNR>
+./submit_all.sh <INIT_TIME> <LEAD_HOUR> <N_ENSEMBLES> <N_GPUS> <PACKAGEROOT> <DATAROOT> <RUNPLOT> <ENVMODE>
 ```
 
 - `INIT_TIME`: Initialization time in format `YYYY-MM-DDTHH` (e.g., `2024-05-06T23`)
 - `LEAD_HOUR`: Number of forecast hours (e.g., `6`)
 - `N_ENSEMBLES`: Number of ensemble members to run (default: `1`)
 - `N_GPUS`: Number of GPUs to use for parallel forecast jobs (default: `1`)
-- `ACCNR`: (Optional) Account number for SLURM jobs (default: `gsd-hpcs`)
+- `PACKAGEROOT`: Repo root (default: `pwd`)
+- `DATAROOT`: Working and output data root (default: `pwd`)
+- `RUNPLOT`: `YES|NO`, run the plotting stage (default: `YES`)
+- `ENVMODE`: `OPN` uses `etc/env_emc.sh`, otherwise `etc/env_mac.sh`
+
+The SLURM account is **not** a positional argument. It is the `ACCNR` environment
+variable (default `gsd-hpcs`), with `FCST_ACCNR` overriding it for the forecast job
+only:
+
+```bash
+ACCNR=my-account ./submit_all.sh 2024-05-06T23 6 10 2
+```
 
 **Example**: Run a 6-hour ensemble forecast with 10 members on 2 GPUs starting from May 6, 2024 at 23:00 UTC:
 ```bash
@@ -122,6 +134,167 @@ Forecasts run via `src/fcst.py` write **both NetCDF and GRIB2** outputs by defau
 
 If you need a standalone conversion utility, use `src/nc2grib.py` (see `Netcdf2Grib`).
 
+## Scripts and entry points
+
+The repo has 25 shell scripts, but only nine are meant to be invoked directly. The
+rest are templates rendered by something else, on-instance provisioners, or one-time
+environment builds. This section is the map.
+
+### The main drivers
+
+#### `run_cycle.sh` — one forecast cycle, locally
+
+Runs the whole pipeline sequentially in one process: `get_ics`, `get_bcs`, `make_ics`,
+`make_bcs`, `fcst`, plots. The non-SLURM counterpart to `submit_all.sh`, with the same
+stages in the same dependency order, fatal on the first failure. `fcst.py` options are
+overridable through environment variables; see the script header for the full list.
+
+```bash
+# 6-hour forecast, 1 member, no plots, on this machine
+./run_cycle.sh 2026-07-29T00 6 1 1 "$PWD" "$PWD" NO
+#              init          lead members gpus pkgroot dataroot runplot
+```
+
+`N_GPUS` is accepted only for interface parity with `submit_all.sh` and is ignored: all
+members run in one process locally, because there is no scheduler or GPU array.
+
+#### `submit_all.sh` — one forecast cycle, on SLURM
+
+The same pipeline as a chain of `sbatch` jobs with `afterok` dependencies, rendering the
+`jobs/job-*.sh` templates into `$DATAROOT/logs/`. The forecast and plot stages run as
+job arrays over `N_GPUS`. Positional arguments are identical to `run_cycle.sh` by
+design. See [Quick Start](#running-forecasts) above.
+
+```bash
+./submit_all.sh 2026-07-29T00 24 4 2 "$PWD" /scratch/hrrrcast YES
+```
+
+#### `aws/run_on_ec2.sh` — one forecast on a GPU instance, then walk away
+
+The main AWS entry point. It renders `aws/user_data.sh` and launches one instance, which
+provisions itself, runs the cycle, streams NetCDF to S3 per lead hour, uploads its logs,
+and terminates itself. Deliberately not an orchestrator.
+
+```bash
+# verify the account is set up correctly, launch nothing
+aws/run_on_ec2.sh --bucket mantari-cast1 --preflight-only
+
+# then the real thing: 24 h, latest safely-available cycle, self-terminating
+aws/run_on_ec2.sh --bucket mantari-cast1 --lead-hours 24 --wait-for-capacity 20
+```
+
+`--dry-run` prints exactly what would happen. `--run-cmd` replaces the command the
+instance executes, which is how the subdomain path below works.
+
+#### `aws/run_subdomain_forecast.sh` — one forecast on a cropped box
+
+Not launched directly: it is the command you hand to `run_on_ec2.sh --run-cmd`. It runs
+the input stages once at full domain (regridding is fixed at 1059x1799), crops the
+`.npz`, and forecasts on the crop only. NetCDF only, because `src/nc2grib.py` hardcodes
+the full grid. See [docs/subdomain.md](docs/subdomain.md).
+
+```bash
+aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T00 --lead-hours 24 \
+    --instance-type g5.2xlarge \
+    --run-cmd "./aws/run_subdomain_forecast.sh '2026-07-29T00' '24' '' '' '35.0,-118.77,33.25,-117.0' '40'"
+```
+
+Positional arguments are `INIT_TIME LEAD_HOURS [HEIGHT] [WIDTH] [BBOX] [HALO]`. `BBOX`
+is `N,W,S,E` in degrees and overrides height and width.
+
+#### `aws/run_domain_test.sh` — the full-domain vs subdomain experiment
+
+Launcher for `aws/domain_test.sh`, which runs **three** forecasts on one instance from
+one set of inputs: full domain, the crop, and a second full-domain run with a different
+member id. The third is the noise yardstick, not padding: diffusion noise is drawn with
+`stateless_normal(shape, seed=[member, hour])`, so the draw depends on the tensor shape
+and a cropped run gets a different realization no matter what. Without it, a
+full-versus-crop difference cannot be attributed to cropping.
+
+```bash
+aws/run_domain_test.sh --bucket mantari-cast1 --init-time 2026-07-29T00 \
+    --lead-hours 24 --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --wait-for-capacity 20
+```
+
+About 60 to 70 minutes and roughly $2.60. Analyse the result locally with
+`src/compare_domains.py`, passing `--ref2-dir` so the noise floor is known.
+
+#### `aws/run_plots.sh` — plot a cycle from S3, separately
+
+Plotting is CPU work that produces thousands of PNGs, so it is split out from the GPU
+run: the forecast streams NetCDF to S3 and deletes as it goes, and plots can be made
+later on a cheap CPU box for any cycle still in the bucket.
+
+```bash
+aws/run_plots.sh --s3-input s3://mantari-cast1/hrrrcast/out \
+    --init-time 2026-07-29T00 --lead-hours 24 --variables surface
+```
+
+`--variables surface` skips the 20-level pressure fields, roughly 120 of the ~170
+figures per lead hour, so it is much quicker and much smaller.
+
+#### `aws/status.sh` — what is running right now
+
+Read-only and free. Finds instances by the `Project=hrrrcast` tag that `run_on_ec2.sh`
+sets, so unrelated instances in the account are never shown.
+
+```bash
+aws/status.sh --logs   # also print the tail of the newest run log
+aws/status.sh --live   # per instance, over SSM: current command, stage, RSS, GPU state
+```
+
+#### `aws/pick_cycle.sh` — which cycle an unattended run should produce
+
+Emits shell-sourceable assignments on stdout and a trace on stderr, and refuses when
+the inputs are not on S3 yet. **The exit codes are the interface:** 0 means a cycle is
+ready, 1 is a hard error, and 3 means nothing to do, which is the normal quiet case
+rather than a failure.
+
+```bash
+eval "$(aws/pick_cycle.sh)" || exit 0
+aws/run_on_ec2.sh --bucket mantari-cast1 --init-time "$INIT_TIME" --gfs-min-lag "$GFS_MIN_LAG"
+```
+
+It exists because launching an instance that then discovers a missing GFS file wastes
+about a dollar and produces a truncated forecast rather than a clean failure. Two HEAD
+requests against the public buckets cost nothing.
+
+#### `aws/deploy_scheduler.sh` — hourly operation
+
+Creates or updates the EventBridge Scheduler rule, the Lambda, and the IAM role.
+**Created disabled and in dry-run mode on purpose,** because hourly 24 h forecasts cost
+roughly $875/month on demand.
+
+The intended rollout, one step at a time. Re-running is safe: everything is
+create-or-update, which is also how you roll out changes.
+
+```bash
+aws/run_on_ec2.sh --bucket mantari-cast1 --stage-scheduler      # 1. pin code + user-data to S3
+aws/deploy_scheduler.sh --bucket mantari-cast1                  # 2. role, Lambda, schedule: DISABLED
+aws/deploy_scheduler.sh --bucket mantari-cast1 --invoke-once    # 3. one manual dry-run; see what it picks
+aws/deploy_scheduler.sh --bucket mantari-cast1 --enable         # 4. hourly, still dry-run
+aws/deploy_scheduler.sh --bucket mantari-cast1 --enable --live  # 5. actually launch instances
+aws/deploy_scheduler.sh --bucket mantari-cast1 --disable        #    stop
+```
+
+Step 1 is a flag on `run_on_ec2.sh`, not on this script: the staged artifacts are the
+same code tarball and user-data template a manual launch uses. The default schedule is
+`cron(5 * * * ? *)`, i.e. HH:05, because the HRRR analysis for hour H lands at about
+H+0:51 and firing on the hour buys nothing. `--delete` removes the schedule, function
+and role.
+
+### Not drivers
+
+| script | role |
+|---|---|
+| [aws/user_data.sh](aws/user_data.sh) | atparse template rendered by `run_on_ec2.sh`, runs at first boot. Every `@[VAR]`, including ones in comments, is substituted |
+| [aws/setup_gpu.sh](aws/setup_gpu.sh) | provisions the conda env and stages the model on the instance; called by the bootstrap |
+| [aws/domain_test.sh](aws/domain_test.sh) | the three-forecast experiment body, run on the instance by `run_domain_test.sh` |
+| [aws/validate_lock.sh](aws/validate_lock.sh) | sanity-checks `aws/conda-linux-64.lock`. Exists because two lock defects reached a live instance, one of which silently ran TensorFlow on CPU at ~1,700 s per lead hour |
+| `jobs/job-*.sh` | seven SLURM templates rendered by `submit_all.sh` |
+| [install_env_mac.sh](install_env_mac.sh), [install_env_ursa.sh](install_env_ursa.sh) | one-time environment builds (Apple Silicon CPU-only, and HPC Linux) |
+| `etc/env.sh`, `etc/env_emc.sh`, `etc/env_mac.sh` | sourced environment selection; `ENVMODE=OPN` selects `env_emc.sh`, otherwise `env_mac.sh` |
+
 ## Running on AWS
 
 An on-demand AWS path exists: one command launches a GPU instance, runs a cycle,
@@ -138,7 +311,7 @@ constraints, is in **[aws/README_aws.md](aws/README_aws.md)**. The essentials:
 
 | | |
 |---|---|
-| Instance | `g6e.2xlarge` (L40S 48 GB). **24 GB GPUs cannot run this model** |
+| Instance | `g6e.2xlarge` (L40S 48 GB) at full domain: **24 GB GPUs cannot run the full CONUS grid**. On a subdomain they can, measured on `g5.2xlarge` (A10G 24 GB); see [docs/subdomain.md](docs/subdomain.md) |
 | Throughput | ~36 s per lead hour on the L40S, versus ~1,720 s on Apple Silicon CPU |
 | A 24 h forecast | ~28 min wall clock, ~10.3 GB of NetCDF |
 | Deliverable | NetCDF to S3, one file per lead hour, uploaded as it is written |
@@ -304,6 +477,16 @@ model = tf.keras.models.load_model("net-deterministic/model.keras", safe_mode=Fa
 
 The spatial grid (530×900) represents every other grid point from the original HRRR grid (1059×1799).
 
+> **Note (Mantari fork).** The current configuration runs the **full 1059×1799 grid**:
+> `make_ics.py` and `make_bcs.py` both set `downsample_factor = 1`. The 530×900 figure
+> above describes a downsampled configuration that the checked-in `net-diffusion/model.keras`
+> is not run at.
+>
+> Do not read 530×900 as a usable input size. The model bakes a fixed reflect-padding of
+> `[[3,2],[1,0]]` followed by three stride-2 poolings, so a valid grid must satisfy
+> `H % 8 == 3` and `W % 8 == 7` — which 530×900 does not. Cropping to a smaller domain
+> is supported and measured; see **[docs/subdomain.md](docs/subdomain.md)**.
+
 ## Data & Channels
 
 Channel counts are dynamic and driven by configuration in `make_ics.py` / `make_bcs.py`. Use those scripts (or `fcst.py`) to confirm the exact channel counts for a given model. The default configuration in `make_ics.py` is:
@@ -406,6 +589,17 @@ Customize log verbosity with `--log_level` on each CLI.
 - Use GPU acceleration when available
 - For large-scale runs, consider batch processing
 - Monitor memory usage during rollout forecasts
+- **Crop the domain if you do not need all of CONUS.** Per-step cost scales with
+  `H*W`: a 25% crop measured 3.3x faster per lead hour and 4.2x faster to write, at a
+  fidelity cost within the model's own ensemble spread for most fields (2 m
+  temperature picks up a ~1 K cold bias). `src/fcst.py` needs no changes; crop the
+  preprocessed `.npz` with `src/crop_domain.py`. See
+  **[docs/subdomain.md](docs/subdomain.md)** for legal sizes, how much halo to leave,
+  and the measured numbers.
+- Do not size hardware from the VRAM that `nvidia-smi` reports during a run. Every
+  run plateaus at ~95% of the GPU regardless of domain size, because `fcst.py` sets
+  `tf.config.optimizer.set_jit(True)` and XLA claims a large fixed pool. That figure
+  measures the allocator, not the workload.
 
 ## Contributing
 
