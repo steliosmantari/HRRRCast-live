@@ -42,16 +42,16 @@ hdr "Live instances (tag Project=hrrrcast)"
 LIVE="$(aws ec2 describe-instances \
     --filters "Name=tag:Project,Values=hrrrcast" \
               "Name=instance-state-name,Values=pending,running,shutting-down,stopping,stopped" \
-    --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,Placement.AvailabilityZone,LaunchTime,Tags[?Key==`InitTime`]|[0].Value,Tags[?Key==`LeadHours`]|[0].Value]' \
+    --query 'Reservations[].Instances[].[InstanceId,InstanceType,State.Name,Placement.AvailabilityZone,LaunchTime,Tags[?Key==`InitTime`]|[0].Value,Tags[?Key==`LeadHours`]|[0].Value,Tags[?Key==`HindcastRun`]|[0].Value]' \
     --output text 2>/dev/null || true)"
 
 if [ -z "$LIVE" ]; then
     echo "  none running"
 else
-    printf '  %-21s %-13s %-14s %-11s %-17s %s\n' INSTANCE TYPE STATE AZ CYCLE LEADS
-    while IFS=$'\t' read -r id type state az launched init leads; do
+    printf '  %-21s %-13s %-14s %-11s %-17s %-6s %s\n' INSTANCE TYPE STATE AZ CYCLE LEADS HINDCAST
+    while IFS=$'\t' read -r id type state az launched init leads hindcast; do
         [ -z "$id" ] && continue
-        printf '  %-21s %-13s %-14s %-11s %-17s %s\n' "$id" "$type" "$state" "$az" "${init:-?}" "${leads:-?}"
+        printf '  %-21s %-13s %-14s %-11s %-17s %-6s %s\n' "$id" "$type" "$state" "$az" "${init:-?}" "${leads:-?}" "${hindcast:-}"
         # Elapsed wall clock, which is what you are billed for.
         if command -v python3 >/dev/null 2>&1; then
             python3 - "$launched" <<'PY' 2>/dev/null || true
@@ -73,7 +73,7 @@ fi
 # running", which the log tail alone does not: a stage can be mid-step for many
 # minutes with nothing new written.
 if [ "$SHOW_LIVE" == "YES" ] && [ -n "$LIVE" ]; then
-    while IFS=$'\t' read -r id _ state _ _ _ _; do
+    while IFS=$'\t' read -r id _ state _ _ _ _ _; do
         [ -z "$id" ] && continue
         [ "$state" == "running" ] || continue
         hdr "What ${id} is executing now (via SSM)"
@@ -105,7 +105,7 @@ JSON
     done <<< "$LIVE"
 fi
 
-hdr "Delivered forecast output (s3://${BUCKET}/hrrrcast/out/)"
+hdr "Delivered forecast output (s3://${BUCKET}/hrrrcast/out/ -- on-demand + hourly only; hindcasts write elsewhere, see below)"
 OUT="$(aws s3 ls --recursive "s3://${BUCKET}/hrrrcast/out/" 2>/dev/null | grep '\.nc$' || true)"
 if [ -z "$OUT" ]; then
     echo "  nothing yet"
@@ -116,6 +116,54 @@ else
           if (path > latest[cycle]) latest[cycle]=path }
         END { for (c in files) printf "  %-14s %3d files  %7.2f GB  newest: %s\n",
                                       c, files[c], bytes[c]/1e9, latest[c] }' | sort
+fi
+
+# Hindcasts (aws/deploy_hindcast.sh) live entirely under their own
+# hrrrcast/hindcast/<run-id>/ prefix -- config, status markers AND output, kept
+# separate from the shared hrrrcast/out/ above precisely so two runs sharing a
+# cycle cannot collide (see aws/README_aws.md, "Output paths don't encode the
+# domain"). Each run-id is a subdirectory here, so this section is where their
+# progress actually lives.
+hdr "Hindcast runs (s3://${BUCKET}/hrrrcast/hindcast/)"
+RUN_IDS="$(aws s3 ls "s3://${BUCKET}/hrrrcast/hindcast/" 2>/dev/null \
+           | awk '/PRE/ {gsub("/",""); print $2}' || true)"
+if [ -z "$RUN_IDS" ]; then
+    echo "  none"
+else
+    for run_id in $RUN_IDS; do
+        PREFIX="hrrrcast/hindcast/${run_id}"
+        CFG="$(aws s3 cp "s3://${BUCKET}/${PREFIX}/config.json" - 2>/dev/null || true)"
+        N_TOTAL="?"; DATES="?"; DOMAIN="?"
+        if [ -n "$CFG" ]; then
+            N_TOTAL="$(printf '%s' "$CFG" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("n_cycles","?"))' 2>/dev/null || echo "?")"
+            DATES="$(printf '%s' "$CFG" | python3 -c "import json,sys
+c=json.load(sys.stdin)
+print(f\"{c['start_date']}..{c['end_date']} @ {','.join(c['init_hours'])}Z\")" 2>/dev/null || echo "?")"
+            DOMAIN="$(printf '%s' "$CFG" | python3 -c "import json,sys
+c=json.load(sys.stdin)
+print(f\"bbox {c['bbox']} +{c['halo']}\")" 2>/dev/null || echo "?")"
+        fi
+
+        STATUS_LIST="$(aws s3 ls "s3://${BUCKET}/${PREFIX}/status/" 2>/dev/null | awk '{print $4}')"
+        # _complete.txt is the Lambda's own "already notified" marker, not a
+        # cycle -- excluded from the count, same as hindcast_handler.py's own
+        # done_cycles() does.
+        N_DONE="$(printf '%s\n' "$STATUS_LIST" | grep -c '\.txt$' || true)"
+        printf '%s\n' "$STATUS_LIST" | grep -q '^_complete\.txt$' \
+            && { N_DONE=$((N_DONE - 1)); COMPLETE="yes"; } || COMPLETE="no"
+
+        SCHED_STATE="$(aws scheduler get-schedule --name "hrrrcast-hindcast-${run_id}" \
+                       --region "$REGION" --query State --output text 2>/dev/null || echo "(deleted)")"
+
+        OUT_STATS="$(aws s3 ls --recursive "s3://${BUCKET}/${PREFIX}/out/" 2>/dev/null \
+                     | grep '\.nc$' | awk '{n++; b+=$3} END {printf "%d files, %.2f GB", n+0, b/1e9}' || true)"
+
+        printf '  %-28s %s\n' "$run_id" "$DATES"
+        printf '    domain     %s\n' "$DOMAIN"
+        printf '    cycles     %s/%s have a status marker (ok+failed; see per-cycle logs for the split)   complete=%-4s schedule=%s\n' \
+               "${N_DONE:-0}" "$N_TOTAL" "$COMPLETE" "$SCHED_STATE"
+        printf '    output     %s   s3://%s/%s/out/\n' "${OUT_STATS:-0 files}" "$BUCKET" "$PREFIX"
+    done
 fi
 
 hdr "Recent run outcomes"

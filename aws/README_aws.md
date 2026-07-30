@@ -203,6 +203,7 @@ aws/run_on_ec2.sh --bucket <your-bucket> --preflight-only
 | `--instance-type` | defaults to `g6e.2xlarge`; anything with under 48 GB VRAM will OOM |
 | `--nc-lsd ""` | opt back out of lossy quantization for a lossless run |
 | `--no-terminate` | leave the box up for inspection; you must then terminate it yourself |
+| `--s3-output URI` | override the default `hrrrcast/out/` -- give this an isolated prefix for any run that might reuse a cycle another experiment already touched (see "Output paths don't encode the domain" under Hindcast, below) |
 
 Two safe modes, and they check different things:
 
@@ -634,6 +635,150 @@ EXIT trap. If an hour fails, the next hour simply runs. `MaximumRetryAttempts` i
 0 on the schedule target for the same reason: a retry would land on the same
 missing data, and `pick_cycle`'s lookback already self-heals a missed tick.
 
+## Hindcast (serverless, resumable backfill)
+
+Running many cycles over a past date range -- a hindcast -- has a different
+shape than either an on-demand run or hourly production: the cycles are all
+already known up front, none of them race a publication clock, and a run
+spanning days needs to survive being interrupted (a redeploy, a laptop closing,
+an AWS hiccup) without either re-billing finished work or silently dropping a
+cycle. The design:
+
+```
+EventBridge Scheduler  rate(10 minutes)  UTC
+    └─> Lambda  hrrrcast-hindcast-<run-id>     (aws/lambda/hindcast_handler.py)
+          ├─ lists s3://BUCKET/hrrrcast/hindcast/<run-id>/status/  (done cycles)
+          ├─ refuses if an instance tagged HindcastRun=<run-id> is in flight,
+          │  or the vCPU quota is full
+          └─> RunInstances for the earliest cycle without a status marker
+                └─> aws/run_hindcast_cycle.sh: run_cycle.sh, then ALWAYS write
+                    one marker (ok / failed(rc=N)) to that S3 prefix
+```
+
+**The only state this trusts is in S3 and on the EC2 instances themselves** --
+which cycles have a status marker, and whether one is currently in flight.
+There is no separate "job queue" or database to go stale. Redeploying,
+re-running `deploy_hindcast.sh` with the same `--run-id`, or just letting the
+schedule sit disabled for a week and re-enabling it, all resume from exactly
+where the markers say the hindcast left off. A cycle that fails still gets a
+marker, so it is never retried and never blocks the cycles after it -- and its
+instance's own `--notify-topic` failure email fires exactly as it would for a
+single on-demand run, with no separate per-cycle notification code needed.
+Once every cycle has a marker, the Lambda sends one completion summary and
+disables its own schedule.
+
+### Deploying it
+
+Same disabled-by-default convention as the hourly scheduler:
+
+```bash
+# 1. stage code, write config.json, create the Lambda + schedule (DISABLED, dry-run)
+aws/deploy_hindcast.sh --bucket mantari-cast1 --run-id socal-june2026 \
+    --start 2026-06-01 --end 2026-06-30 --init-hours 00,06,12,18 \
+    --lead-hours 24 --output-hours 0:3:24 \
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 80 \
+    --notify-topic arn:aws:sns:us-east-1:334566771276:hrrrcast-runs
+
+# 2. one manual tick, see what it would launch
+aws/deploy_hindcast.sh --bucket mantari-cast1 --run-id socal-june2026 --invoke-once
+
+# 3. go live, then turn the schedule on
+aws/deploy_hindcast.sh --bucket mantari-cast1 --run-id socal-june2026 --live --enable
+
+# progress at any time (out of however many cycles the date range enumerates)
+aws s3 ls s3://mantari-cast1/hrrrcast/hindcast/socal-june2026/status/ | wc -l
+
+# stop / resume later / remove the launcher only (S3 state and outputs are kept)
+aws/deploy_hindcast.sh --bucket mantari-cast1 --run-id socal-june2026 --disable
+aws/deploy_hindcast.sh --bucket mantari-cast1 --run-id socal-june2026 --enable
+aws/deploy_hindcast.sh --bucket mantari-cast1 --run-id socal-june2026 --delete
+```
+
+`--output-hours "start:step:end"` (e.g. `0:3:24`) is a new `fcst.py` option: the
+autoregressive rollout still computes every lead hour (the state depends on it),
+but only the listed hours are built, written and uploaded. Useful for a hindcast
+where 3-hourly output is enough and 8x fewer NetCDF files is worth having.
+
+### `run_hindcast.sh`: the non-serverless alternative
+
+`aws/run_hindcast.sh` loops cycles on ONE already-booted instance instead of one
+instance per cycle (`aws/launch_hindcast.sh` launches it). It skips a failed
+cycle and keeps going, same as the serverless path, but trades the per-cycle
+instance-boot overhead for depending on that one instance staying up for the
+whole run.
+
+**It does not currently save the model-load cost either.** Each cycle shells
+out to a fresh `python3 src/fcst.py` process (`run_cycle.sh`'s `run_stage
+fcst`), so the model reloads once per cycle even though it is the same
+GPU/process lineage the whole time -- the ~5 min TF-import + model-load cost
+(see `OVERLAP_FCST`'s doc comment in `run_cycle.sh`) repeats N times across N
+cycles for no reason. On a 120-cycle month that is roughly 10 h of pure
+overhead. Fixing it means restructuring `fcst.py`'s entry point into a
+persistent driver that loads the model once and loops internally, which is a
+real change, not a small patch -- not done yet. Until it is, the serverless
+path above pays the same per-cycle model-load cost but at least parallelizes
+none of it away either, so there is currently no efficiency reason to prefer
+`run_hindcast.sh` -- use it only when you specifically want everything on one
+box (e.g. for interactive debugging across cycles).
+
+### Verified 2026-07-30
+
+A real 2-cycle SoCal run (`2026-07-29T00Z` and `06Z`, halo 80, `--output-hours
+0:3:24`) confirmed the design end to end: instance `i-05e08c52ae92cf0f3` (cycle
+1) and `i-0e810e895385ebc6c` (cycle 2) both completed successfully, each writing
+exactly `f00,f03,f06,...,f24` to S3, and the Lambda correctly picked cycle 2
+only after cycle 1's marker existed. Two real bugs surfaced and were fixed
+during that test:
+
+- **`hrrrcast-runner`'s own IAM role had no `s3:PutObject` on
+  `hrrrcast/hindcast/*`.** The Lambda's role was extended for this feature, but
+  the *instance* role that actually writes the per-cycle status marker was not
+  -- so cycle 1 ran and delivered correct output, but its marker upload failed
+  with `AccessDenied` and only a warning was logged. Fixed in
+  [iam/hrrrcast-runner-policy.json](iam/hrrrcast-runner-policy.json); applied
+  live via `aws iam put-role-policy`. Backfilled the missing marker by hand for
+  that one cycle rather than re-running an already-successful 24 h forecast.
+- **Self-disable needed `iam:PassRole` on its own role**, scoped to
+  `scheduler.amazonaws.com`, which was missing; and the completion check
+  short-circuited before retrying a failed disable on a later tick. Both fixed
+  in [iam/lambda-launcher-policy.json](iam/lambda-launcher-policy.json) and
+  [lambda/hindcast_handler.py](lambda/hindcast_handler.py).
+
+Two pre-existing gaps, not introduced by this feature, found along the way --
+both since resolved:
+
+- **The SNS topic `hrrrcast-runs` did not exist in this account.** Every
+  `--notify-topic` reference in this codebase (per-instance failure emails, the
+  hindcast completion summary) pointed at an ARN that `aws sns list-topics`
+  did not list; every publish attempt failed silently with only a logged
+  warning. **Fixed 2026-07-30**: the topic now exists
+  (`arn:aws:sns:us-east-1:334566771276:hrrrcast-runs`) with a confirmed email
+  subscription. Verify with `aws sns list-subscriptions-by-topic --topic-arn
+  arn:aws:sns:us-east-1:334566771276:hrrrcast-runs` -- a real `SubscriptionArn`
+  means it is live, `"PendingConfirmation"` means the email link has not been
+  clicked yet.
+- **Output paths didn't encode the domain.** `s3://BUCKET/hrrrcast/out/<date>/<hour>/`
+  is keyed only by init time, so two different experiments (different bbox,
+  different halo) that happen to use the same cycle silently overwrite each
+  other's files there. Observed directly: this test's `f19.nc` at
+  `20260729/00/` was a leftover from an earlier, unrelated SoCal experiment that
+  used the same cycle, sitting next to this run's own `f00,f03,...,f24`.
+  **Fixed 2026-07-30** for the hindcast path specifically: `deploy_hindcast.sh`
+  now passes `run_on_ec2.sh`'s new `--s3-output` override (default unchanged)
+  so every hindcast writes to its own `hrrrcast/hindcast/<run-id>/out/`, never
+  the shared prefix. Re-verified live the same day with a fresh single-cycle
+  run (`i-0120791132589ba7e`, run-id `socal-test-output-fix`,
+  `2026-07-29T12`): its 9 files landed under
+  `hrrrcast/hindcast/socal-test-output-fix/out/20260729/12/`, and the shared
+  `hrrrcast/out/20260729/12/` still held only its original, unrelated
+  full-domain files -- nothing leaked across. On-demand and hourly runs still
+  use the shared `hrrrcast/out/` by default -- give those `--s3-output` too if
+  a run might reuse a cycle another experiment already touched.
+
+**Not yet fixed:** `run_hindcast.sh` reloads the model once per cycle instead
+of once for the whole run -- see the note under "the non-serverless
+alternative" above.
+
 ## Subdomain inference (cheaper, tested)
 
 Cropping the domain cuts cost, because the cost of a step scales with `H*W`. Measured
@@ -821,6 +966,11 @@ specific point:
 | [user_data.sh](user_data.sh) | instance bootstrap template; always self-terminates |
 | [setup_gpu.sh](setup_gpu.sh) | provisions the conda env, stages the model, verifies GPU |
 | [run_plots.sh](run_plots.sh) | independent plot job reading NetCDF from S3 |
+| [deploy_hindcast.sh](deploy_hindcast.sh) | serverless hindcast: stages code, writes `config.json`, creates/updates the Lambda + schedule |
+| [lambda/hindcast_handler.py](lambda/hindcast_handler.py) | hindcast driver: resumes from S3 status markers, launches one cycle at a time |
+| [run_hindcast_cycle.sh](run_hindcast_cycle.sh) | one cycle + its S3 status marker; what each serverless-hindcast instance runs |
+| [run_hindcast.sh](run_hindcast.sh) | non-serverless alternative: loops cycles on one already-booted instance |
+| [launch_hindcast.sh](launch_hindcast.sh) | launcher for `run_hindcast.sh` |
 | [environment.aws.yaml](environment.aws.yaml) | GPU conda env (TF 2.15 + boto3) |
 | [../src/s3io.py](../src/s3io.py) | per-hour upload with retries and local purge |
 | [../run_cycle.sh](../run_cycle.sh) | the cycle itself; see its header for all knobs |
