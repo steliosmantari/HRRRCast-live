@@ -39,6 +39,14 @@
 #   --model-s3 URI         model.keras location         [s3://BUCKET/hrrrcast/model.keras]
 #   --nc-complevel N       NetCDF zlib level, 0-9       [1]
 #   --nc-lsd N             LOSSY quantization digits    [2; pass "" for lossless]
+#   --bbox N,W,S,E         crop the FORECAST to a box containing this region plus
+#                          --halo cells on every side. Input stages still run at
+#                          full domain (regridding is fixed at 1059x1799); only
+#                          inference is cropped, which is where the cost is.
+#                          Default: full domain. See docs/subdomain.md
+#   --halo N               halo cells around --bbox [40]. Measured: error is
+#                          elevated within ~20 cells of the crop edge and flat
+#                          beyond, so 20-40 captures nearly all of the benefit
 #   --make-bcs-workers N   GFS regrid worker cap        [2]
 #   --notify-topic ARN     SNS topic to email a run summary to when the run ends,
 #                          success or failure [$HRRRCAST_SNS_TOPIC, else none]
@@ -94,6 +102,10 @@ NC_LSD=2
 # "auto" lets the instance size its own make_bcs pool from measured RAM (see
 # user_data.sh). A fixed number was only ever right for one instance type.
 MAKE_BCS_WORKERS=auto
+# Subdomain cropping, passed straight through to run_cycle.sh on the instance.
+# Empty = full 1059x1799 domain, the default and what every run before this did.
+SUB_BBOX=""
+SUB_HALO=40
 # Empty = no notification. Set to an SNS topic ARN (or export HRRRCAST_SNS_TOPIC)
 # to get an email summary when a run ends, success or failure.
 SNS_TOPIC="${HRRRCAST_SNS_TOPIC:-}"
@@ -141,6 +153,8 @@ while [ $# -gt 0 ]; do
         --nc-lsd)              NC_LSD="$2"; shift 2 ;;
         --gfs-min-lag)         GFS_MIN_LAG="$2"; shift 2 ;;
         --make-bcs-workers)    MAKE_BCS_WORKERS="$2"; shift 2 ;;
+        --bbox)                SUB_BBOX="$2"; shift 2 ;;
+        --halo)                SUB_HALO="$2"; shift 2 ;;
         --notify-topic)        SNS_TOPIC="$2"; shift 2 ;;
         --wait-for-capacity)   WAIT_CAPACITY_MIN="$2"; shift 2 ;;
         --preflight-only)      PREFLIGHT_ONLY="YES"; shift ;;
@@ -311,6 +325,14 @@ fi
 case "$RUN_CMD" in *'@['*) die "--run-cmd must not contain @[...]; atparse would try to expand it." ;; esac
 USER_DATA_FILE="$(mktemp -t hrrrcast-userdata)"
 # shellcheck disable=SC1091
+# One human-readable description, used in the launcher summary and baked into the
+# instance's own summary so a log always says which domain it ran.
+if [ -n "$SUB_BBOX" ]; then
+    SUB_DESC="subdomain: bbox ${SUB_BBOX} + ${SUB_HALO}-cell halo"
+else
+    SUB_DESC="full 1059x1799"
+fi
+
 source "${REPO_DIR}/atparse.bash"
 atparse \
     INIT_TIME="$INIT_TIME" LEAD_HOUR="$LEAD_HOUR" N_ENSEMBLES="$N_ENSEMBLES" \
@@ -318,6 +340,7 @@ atparse \
     CODE_S3="$CODE_S3" CODE_REF="$CODE_REF" MODEL_S3="$MODEL_S3" \
     RUN_USER="$RUN_USER" NC_COMPLEVEL="$NC_COMPLEVEL" NC_LSD="$NC_LSD" \
     MAKE_BCS_WORKERS="$MAKE_BCS_WORKERS" TERMINATE="$TERMINATE" \
+    SUB_BBOX="$SUB_BBOX" SUB_HALO="$SUB_HALO" SUB_DESC="$SUB_DESC" \
     SNS_TOPIC="$SNS_TOPIC" GFS_MIN_LAG="$GFS_MIN_LAG" RUN_CMD="$RUN_CMD" \
     < "${REPO_DIR}/aws/user_data.sh" > "$USER_DATA_FILE"
 
@@ -336,6 +359,7 @@ cat <<EOF
   outputs          ${S3_OUTPUT}/<YYYYMMDD>/<HH>/
   logs             ${S3_LOGS}/
   netcdf           complevel=${NC_COMPLEVEL} lsd=${NC_LSD:-off}
+  domain           ${SUB_DESC}
   gfs cycle lag    ${GFS_MIN_LAG} h
   grib2            disabled
   plots            separate job (aws/run_plots.sh)
@@ -375,6 +399,7 @@ if [ "$STAGE_SCHEDULER" == "YES" ]; then
         CODE_S3="$CODE_S3" CODE_REF="$CODE_REF" MODEL_S3="$MODEL_S3" \
         RUN_USER="$RUN_USER" NC_COMPLEVEL="$NC_COMPLEVEL" NC_LSD="$NC_LSD" \
         MAKE_BCS_WORKERS="$MAKE_BCS_WORKERS" TERMINATE="$TERMINATE" \
+        SUB_BBOX="$SUB_BBOX" SUB_HALO="$SUB_HALO" SUB_DESC="$SUB_DESC" \
         SNS_TOPIC="$SNS_TOPIC" GFS_MIN_LAG="__GFS_MIN_LAG__" RUN_CMD="$RUN_CMD" \
         < "${REPO_DIR}/aws/user_data.sh" > "$TEMPLATE_FILE"
 

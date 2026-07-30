@@ -103,6 +103,7 @@ Outputs          ${OUT_LINE:-none}
                  ${OUT_PREFIX}/
 NetCDF settings  complevel=@[NC_COMPLEVEL], least_significant_digit=@[NC_LSD] (GRIB2 off, the default)
 GFS cycle lag    @[GFS_MIN_LAG] h (0 = newest cycle)
+Domain           @[SUB_DESC]
 
 make_bcs         finished ${BCS_T:-n/a}, ${WORKERS:-?} worker process(es)
 forecast         ${PREDICTS:-did not run}
@@ -236,6 +237,11 @@ sudo -u "$RUN_USER" -H bash -lc "
     export OVERLAP_FCST=YES
     export NC_LSD='@[NC_LSD]'
     export GFS_MIN_LAG='@[GFS_MIN_LAG]'
+    # Subdomain cropping. Empty SUB_BBOX = full domain, which is the default and
+    # what every run before this did. run_cycle.sh does the crop between the input
+    # stages and the forecast; see docs/subdomain.md.
+    export SUB_BBOX='@[SUB_BBOX]'
+    export SUB_HALO='@[SUB_HALO]'
     export DATAROOT='$WORKDIR'
     # RUN_CMD is normally the run_cycle.sh line below. run_on_ec2.sh --run-cmd
     # replaces it so an experiment can reuse this whole bootstrap (code fetch, conda

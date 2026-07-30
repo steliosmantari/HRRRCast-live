@@ -148,6 +148,29 @@ an error.
 `crop_domain.py` also writes `subdomain.json` recording the box, which
 `compare_domains.py` uses to align a cropped run against a full one.
 
+## 3b. Or let run_cycle.sh do it
+
+Sections 3 and 4 are the manual sequence, and worth reading once because they show what
+the crop actually does. For running rather than understanding, `run_cycle.sh` performs
+the same steps in one call:
+
+```bash
+SUB_BBOX=35.0,-118.77,33.25,-117.0 SUB_HALO=40 \
+    ./run_cycle.sh 2026-07-29T00 24 1 1 "$PWD" "$PWD" NO
+```
+
+It runs the input stages at full domain, crops between them and the forecast, points the
+forecast at its own base directory (`$DATAROOT/subrun`), and copies `subdomain.json`
+next to the outputs. `SUB_HEIGHT`/`SUB_WIDTH` crop a fixed grid-centred box instead;
+they must be set together. Unset means full domain, unchanged.
+
+On AWS the same thing is `aws/run_on_ec2.sh --bbox N,W,S,E --halo N`, which also works
+with `--stage-scheduler` for hourly operation. See
+[aws/README_aws.md](../aws/README_aws.md).
+
+Verified bit-identical to the manual sequence: given the same cropped inputs, all 70
+variables match to 0.
+
 ## 4. Run the forecast
 
 `fcst.py` reads its inputs from `<base_dir>/<YYYYMMDD>/<HH>/`, so give the cropped run
