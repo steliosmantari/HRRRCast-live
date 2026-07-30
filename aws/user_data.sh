@@ -102,6 +102,7 @@ Wall clock       ${ELAPSED_MIN} min
 Outputs          ${OUT_LINE:-none}
                  ${OUT_PREFIX}/
 NetCDF settings  complevel=@[NC_COMPLEVEL], least_significant_digit=@[NC_LSD] (GRIB2 disabled)
+GFS cycle lag    @[GFS_MIN_LAG] h (0 = newest cycle)
 
 make_bcs         finished ${BCS_T:-n/a}, ${WORKERS:-?} worker process(es)
 forecast         ${PREDICTS:-did not run}
@@ -232,8 +233,15 @@ sudo -u "$RUN_USER" -H bash -lc "
     # GPU is otherwise idle for that whole phase.
     export OVERLAP_FCST=YES
     export NC_LSD='@[NC_LSD]'
-    ./run_cycle.sh '@[INIT_TIME]' '@[LEAD_HOUR]' '@[N_ENSEMBLES]' 1 '$WORKDIR' '$WORKDIR' NO
-" || fail "run_cycle.sh failed"
+    export GFS_MIN_LAG='@[GFS_MIN_LAG]'
+    export DATAROOT='$WORKDIR'
+    # RUN_CMD is normally the run_cycle.sh line below. run_on_ec2.sh --run-cmd
+    # replaces it so an experiment can reuse this whole bootstrap (code fetch, conda
+    # env, logging, log shipping, self-termination) instead of duplicating it. Used by
+    # aws/run_domain_test.sh. PURGE_LOCAL is deliberately left YES: any replacement
+    # command still streams to S3 and must not fill the root volume.
+    @[RUN_CMD]
+" || fail "the run command failed"
 
 STATUS="success"
 echo "Outputs delivered to @[S3_OUTPUT]"
