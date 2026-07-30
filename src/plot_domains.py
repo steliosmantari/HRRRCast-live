@@ -54,6 +54,7 @@ def subset_to_box(ds: xr.Dataset, N: float, W: float, S: float, E: float,
     """
     lat = ds["latitude"].values
     lon = ds["longitude"].values
+    ydim, xdim = _spatial_dims(ds)
     mask = (lat >= S - pad) & (lat <= N + pad) & (lon >= W - pad) & (lon <= E + pad)
     if not mask.any():
         return None
@@ -61,7 +62,23 @@ def subset_to_box(ds: xr.Dataset, N: float, W: float, S: float, E: float,
     cols = np.where(mask.any(axis=0))[0]
     r0, r1 = int(rows[0]), int(rows[-1])
     c0, c1 = int(cols[0]), int(cols[-1])
-    return ds.isel(latitude=slice(r0, r1 + 1), longitude=slice(c0, c1 + 1))
+    return ds.isel({ydim: slice(r0, r1 + 1), xdim: slice(c0, c1 + 1)})
+
+
+def _spatial_dims(ds):
+    """Names of the (y, x) dims, whichever output schema this file uses.
+
+    Pre-CF output named the spatial dims "latitude"/"longitude". Since the
+    CF-1.6 merge they are "y"/"x", with latitude/longitude kept as 2-D
+    coordinate VARIABLES on those dims (which is what CF requires for a
+    curvilinear grid). Both layouts are read here so this driver works on
+    archived output as well as current output.
+    """
+    lat = ds["latitude"]
+    if lat.ndim == 2:
+        return lat.dims[0], lat.dims[1]
+    # 1-D latitude/longitude: the dims are the coordinate names themselves.
+    return "latitude", "longitude"
 
 
 def _build_bary_interpolator(src_lon, src_lat, tgt_lon, tgt_lat):
@@ -114,16 +131,22 @@ def regrid_to_latlon(ds: xr.Dataset, N: float, W: float, S: float, E: float,
     interp = _build_bary_interpolator(
         ds_bb["longitude"].values, ds_bb["latitude"].values, LON, LAT)
 
+    src_ydim, src_xdim = _spatial_dims(ds_bb)
     data_vars = {}
     for name, da in ds_bb.data_vars.items():
-        if da.dims[-2:] != ("latitude", "longitude"):
+        if da.dims[-2:] != (src_ydim, src_xdim):
+            # Skips non-spatial variables, including the scalar `grid_mapping`
+            # container the CF merge added.
             continue
         lead_shape = da.shape[:-2]
         flat = da.values.reshape(-1, da.shape[-2] * da.shape[-1])
         out = np.empty((flat.shape[0], ny * nx), dtype=float)
         for i in range(flat.shape[0]):
             out[i] = interp(flat[i])
-        data_vars[name] = (da.dims, out.reshape(lead_shape + (ny, nx)))
+        # The regridded product is a regular lat/lon grid, so its trailing dims
+        # are named latitude/longitude regardless of what the source called them.
+        out_dims = da.dims[:-2] + ("latitude", "longitude")
+        data_vars[name] = (out_dims, out.reshape(lead_shape + (ny, nx)))
 
     coords = {
         "latitude": ("latitude", lat_t),

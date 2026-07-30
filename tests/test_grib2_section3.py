@@ -59,7 +59,10 @@ ds.close()
 
 print("\nTEST 4: refuses a north-to-south grid instead of misplacing the corner")
 ds = xr.open_dataset(CROP)
-flipped = ds.isel(latitude=slice(None, None, -1))
+# Flip along whichever dim latitude actually spans, so this test does not depend
+# on the pre-CF dim naming (post-merge output uses y/x).
+ydim = ds["latitude"].dims[0] if ds["latitude"].ndim == 2 else "latitude"
+flipped = ds.isel({ydim: slice(None, None, -1)})
 try:
     Netcdf2Grib().section3_from_dataset(flipped)
     check("raises on flipped grid", False, "no exception")
