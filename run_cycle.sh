@@ -148,11 +148,20 @@ HOUR=${INIT_TIME#*T}
 if [ -n "$SUB_BBOX" ] || { [ -n "$SUB_HEIGHT" ] && [ -n "$SUB_WIDTH" ]; }; then
     SUBDOMAIN=YES
     FCST_ROOT="${DATAROOT}/subrun"
-    CROP_DIR="${DATAROOT}/${DATE}/${HOUR}-sub"
     if [ -n "$SUB_BBOX" ]; then
+        # A named region plus a halo is what src/crop_grib2.py needs to crop the RAW
+        # inputs before make_ics.py/make_bcs.py run, which is what actually saves
+        # their cost rather than only the forecast's.
+        CROP_MODE=raw
         CROP_ARGS=(--bbox "$SUB_BBOX" --halo "$SUB_HALO")
         SUB_DESC="bbox ${SUB_BBOX} + ${SUB_HALO}-cell halo"
     else
+        # A fixed grid-centred box has no region to protect with a halo, so it stays
+        # on the older path: crop the .npz AFTER make_ics.py/make_bcs.py run at full
+        # domain (src/crop_domain.py). That does nothing for input-stage cost, only
+        # for the forecast itself.
+        CROP_MODE=npz
+        CROP_DIR="${DATAROOT}/${DATE}/${HOUR}-sub"
         CROP_ARGS=(--height "$SUB_HEIGHT" --width "$SUB_WIDTH")
         SUB_DESC="${SUB_HEIGHT} x ${SUB_WIDTH} (grid-centred)"
     fi
@@ -220,6 +229,43 @@ run_stage() {
 
 # Stages 1-4 prepare the inputs. Grouped in a function so the forecast can either
 # follow them (default) or run concurrently with them (OVERLAP_FCST=YES).
+# gfs_to_hrrr_weights.nc's name is hardcoded inside make_bcs.py (not a --flag), and
+# it is looked up relative to whatever directory the process is CWD'd in when make_bcs
+# runs, which is DATAROOT (this script cd's there before Stage 1). xESMF's
+# reuse_weights=True means: if that file exists, USE IT, regardless of whether it was
+# built for this run's target grid. A full-domain weights file and a subdomain one are
+# different shapes, and make_bcs.py has no size check of its own -- xESMF raises
+# "invalid entry in coordinates array" if the shapes disagree (confirmed by testing:
+# it fails loudly rather than silently misregridding), but a run that dies there is
+# still a run that dies. Two different subdomain boxes collide the same way.
+#
+# Handled here, without touching make_bcs.py: key a cache of weights files by the
+# target grid actually in play (the crop's y0/x0/height/width, or "full" for no crop),
+# stage the right one in before calling make_bcs.py, and put whatever it built back in
+# the cache afterward -- then remove the generic filename so it cannot be picked up by
+# a DIFFERENT box on a later run in this same DATAROOT. This preserves the reuse this
+# script has always relied on (repeat runs at the same box regenerate nothing) while
+# making a box change safe instead of a landmine for whoever runs next.
+WEIGHTS_FILE="gfs_to_hrrr_weights.nc"     # must match make_bcs.py's hardcoded name
+WEIGHTS_CACHE="${DATAROOT}/.weights_cache"
+stage_weights_for() {   # $1 = cache key
+    mkdir -p "$WEIGHTS_CACHE"
+    rm -f "$WEIGHTS_FILE"
+    # A cache miss (first run at this box) is normal, not an error: under
+    # set -e, a bare `[ -f X ] && cp ...` as a standalone statement returns 1
+    # and kills the whole script the moment the file is absent. `if` guards
+    # against that regardless of which branch is taken.
+    if [ -f "${WEIGHTS_CACHE}/$1.nc" ]; then
+        cp "${WEIGHTS_CACHE}/$1.nc" "$WEIGHTS_FILE"
+    fi
+}
+save_weights_as() {   # $1 = cache key
+    if [ -f "$WEIGHTS_FILE" ]; then
+        cp "$WEIGHTS_FILE" "${WEIGHTS_CACHE}/$1.nc"
+    fi
+    rm -f "$WEIGHTS_FILE"
+}
+
 run_input_stages() {
     # --- Stage 1: get ICs  (jobs/job-get-ics.sh) ----------------------------
     run_stage get-ics \
@@ -230,23 +276,94 @@ run_input_stages() {
         python3 "${PACKAGEROOT}/src/get_bcs.py" "${INIT_TIME}" "${LEAD_HOUR}" --base_dir "${DATAROOT}" \
             --gfs_min_lag_hours "${GFS_MIN_LAG}"
 
-    # --- Stage 3: make ICs  (depends on get-ics; jobs/job-make-ics.sh) ------
+    HRRR_GRID_FILE="${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+    ICS_BASE_DIR="${DATAROOT}"
+    # Raw-crop mode writes make_ics/make_bcs output directly into FCST_ROOT, already
+    # at the cropped size. Grid-centred (npz) crop mode and full domain both write to
+    # DATAROOT at full size; npz mode then crops that into FCST_ROOT as Stage 4b below.
+    if [ "$SUBDOMAIN" == "YES" ] && [ "$CROP_MODE" == "raw" ]; then
+        ICS_OUTPUT_DIR="${FCST_ROOT}"
+    else
+        ICS_OUTPUT_DIR="${DATAROOT}"
+    fi
+    WEIGHTS_KEY="full"
+
+    # --- Stage 2b: crop the RAW GRIB2, when a region+halo was requested -----
+    # Cropping here, before make_ics.py/make_bcs.py run, is what actually saves
+    # money: measured, input staging is ~450s of a subdomain forecast's wall clock
+    # (55%), because make_ics.py reads every field with pygrib over the full
+    # 1059x1799 grid and make_bcs.py's xESMF regridder targets that many output
+    # points, regardless of how small the eventual forecast domain is. Cropping
+    # the .npz AFTER preprocessing (src/crop_domain.py, still used by
+    # aws/domain_test.sh for fidelity experiments, where full-domain and cropped
+    # runs must share bit-identical inputs) does nothing for that cost.
+    #
+    # make_ics.py and make_bcs.py are not modified: pygrib and grbs[1].latlons()
+    # read whatever grid is actually in the file, and their hardcoded-1059x1799
+    # shape check is a logged warning, never fatal (src/make_ics.py:434,
+    # src/make_bcs.py:765). See src/crop_grib2.py's module docstring for how the
+    # crop is done (wgrib2 -ijsmall_grib) and how it was verified: 162 of 170
+    # surface fields bit-identical to the corresponding window of the full file,
+    # the rest at GRIB2 repacking precision (1e-5 to 1e-18 relative), not
+    # resampling error.
+    #
+    # net-diffusion/normalize-stats.nc carries LAND/OROG stats added for this:
+    # make_ics.py falls back to computing them FROM WHATEVER DATA IT IS GIVEN when
+    # the norm file lacks an entry, which is fine at full domain (same domain every
+    # time) but means a raw crop and the full domain disagree on their own local
+    # land fraction. Fixed stats make both runs agree; verified to change nothing
+    # else (see docs/subdomain.md).
+    if [ "$SUBDOMAIN" == "YES" ] && [ "$CROP_MODE" == "raw" ]; then
+        # make_ics.py always resolves its inputs as <base_dir>/<DATE>/<HOUR>/..., the
+        # same as get_ics.py's own output layout, and it is not told otherwise here
+        # (no code change). crop_grib2.py writes flat into whatever --out-dir it is
+        # given, so that has to BE the nested <DATE>/<HOUR> leaf; ICS_BASE_DIR is the
+        # directory above it, which is what make_ics.py's --base_dir must be.
+        RAW_CROP_DIR="${DATAROOT}/${DATE}/${HOUR}-sub-raw"
+        run_stage crop-inputs \
+            python3 "${PACKAGEROOT}/src/crop_grib2.py" \
+                --in-dir "${DATAROOT}/${DATE}/${HOUR}" \
+                --out-dir "${RAW_CROP_DIR}/${DATE}/${HOUR}" \
+                "${CROP_ARGS[@]}"
+        ICS_BASE_DIR="${RAW_CROP_DIR}"
+        HRRR_GRID_FILE="${RAW_CROP_DIR}/${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+        WEIGHTS_KEY="$(python3 -c "import json;m=json.load(open('${RAW_CROP_DIR}/${DATE}/${HOUR}/subdomain.json'));print(f\"{m['height']}x{m['width']}_y{m['y0']}_x{m['x0']}\")")"
+        mkdir -p "${FCST_ROOT}/${DATE}/${HOUR}"
+        # Carry the crop definition next to the outputs so a consumer can tell which
+        # part of the field is product and which is halo to discard.
+        cp "${RAW_CROP_DIR}/${DATE}/${HOUR}/subdomain.json" "${FCST_ROOT}/${DATE}/${HOUR}/" 2>/dev/null || true
+    fi
+
+    # --- Stage 3: make ICs  (depends on get-ics/crop-inputs) ----------------
+    # ICS_BASE_DIR is the cropped-raw directory in raw-crop mode, DATAROOT
+    # otherwise. In raw-crop mode this writes directly into FCST_ROOT already at
+    # the cropped size; a plain full-domain or grid-centred run writes at full
+    # size to DATAROOT, and the grid-centred (npz) crop mode below crops it after.
     run_stage make-ics \
         python3 "${PACKAGEROOT}/src/make_ics.py" "${STATS}" "${INIT_TIME}" \
-            --base_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+            --base_dir "${ICS_BASE_DIR}" --output_dir "${ICS_OUTPUT_DIR}"
 
-    # --- Stage 4: make BCs  (depends on get-bcs; jobs/job-make-bcs.sh) ------
+    # --- Stage 4: make BCs  (depends on get-bcs) ----------------------------
+    # --base_dir stays DATAROOT even when cropping: GFS is not cropped by this
+    # script (it is read once per lead hour regardless of the HRRR-side box, so
+    # cropping it is a separate, unimplemented optimisation; see docs/subdomain.md).
+    # --hrrr_grid_file is the cropped surface grib2 in raw-crop mode, which is what
+    # actually shrinks the xESMF regrid: it defines the TARGET grid, and the
+    # regridder's cost scales with target points, not with how much of GFS was
+    # read to reach them.
+    stage_weights_for "$WEIGHTS_KEY"
     run_stage make-bcs \
         python3 "${PACKAGEROOT}/src/make_bcs.py" "${STATS}" "${INIT_TIME}" "${LEAD_HOUR}" \
-            --base_dir "${DATAROOT}" --output_dir "${DATAROOT}" \
-            --hrrr_grid_file "${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+            --base_dir "${DATAROOT}" --output_dir "${ICS_OUTPUT_DIR}" \
+            --hrrr_grid_file "${HRRR_GRID_FILE}"
+    save_weights_as "$WEIGHTS_KEY"
 
-    # --- Stage 4b: crop, when a subdomain was requested ---------------------
+    # --- Stage 4b: crop the .npz, for the grid-centred (npz) mode only ------
     # Deliberately inside run_input_stages: with OVERLAP_FCST=YES the forecast is
     # already running and blocked on the sentinel, which is touched only after this
     # returns. So the crop is covered by the same barrier as the input stages, and
     # the forecast cannot start reading a half-written cropped npz.
-    if [ "$SUBDOMAIN" == "YES" ]; then
+    if [ "$SUBDOMAIN" == "YES" ] && [ "$CROP_MODE" == "npz" ]; then
         run_stage crop \
             python3 "${PACKAGEROOT}/src/crop_domain.py" \
                 --in-dir "${DATAROOT}/${DATE}/${HOUR}" --out-dir "${CROP_DIR}" \
@@ -258,8 +375,6 @@ run_input_stages() {
         cp "${CROP_DIR}/hrrr_${DATE}_${HOUR}.npz" \
            "${CROP_DIR}/gfs_${DATE}_${HOUR}.npz" \
            "${FCST_ROOT}/${DATE}/${HOUR}/" || die "staging cropped inputs failed"
-        # Carry the crop definition next to the outputs so a consumer can tell which
-        # part of the field is product and which is halo to discard.
         cp "${CROP_DIR}/subdomain.json" "${FCST_ROOT}/${DATE}/${HOUR}/" 2>/dev/null || true
     fi
 }

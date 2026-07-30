@@ -41,11 +41,16 @@ aws/run_on_ec2.sh --bucket mantari-cast1 --lead-hours 24 \
     --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --stage-scheduler
 ```
 
-All three run the input stages at full domain (the GFS-to-HRRR regridding weights are
-fixed at 1059x1799), crop, and forecast on the crop, which is where the cost is. A
-cropped run writes to its own root, `$DATAROOT/subrun/<YYYYMMDD>/<HH>/`, so cropped and
-full-domain output never collide. Use `SUB_HEIGHT`/`SUB_WIDTH` (together) for a fixed
-grid-centred box instead of a region.
+All three crop the *raw* HRRR GRIB2 before the input stages run (see "Cropping the
+HRRR-side inputs" below), not just the forecast: `make_ics.py` runs 4.6x faster and
+`make_bcs.py` 1.5-1.6x faster on the crop, measured. GFS itself is not cropped, so
+its per-lead-hour read stays the same size regardless of the box. A cropped run
+writes to its own root, `$DATAROOT/subrun/<YYYYMMDD>/<HH>/`, so cropped and
+full-domain output never collide. Use `SUB_HEIGHT`/`SUB_WIDTH` (together) for a
+fixed grid-centred box instead of a region; that mode has no region to protect
+with a halo, so it stays on the older, slower path of cropping the full-domain
+`.npz` after the input stages run (still used by `aws/domain_test.sh`'s fidelity
+experiments, where full-domain and cropped runs must share bit-identical inputs).
 
 ### Sizing or checking a box without running anything
 
@@ -403,15 +408,75 @@ is the same, just less extreme.)
 
 The 24 h forecast becomes cheap, and the run is then dominated by **downloading and
 preprocessing full-CONUS GFS and HRRR** (~450 s) and **loading the model** (~230 s).
-Optimising the model further would be pointless; the targets become
+Optimising the model further would be pointless; the targets are the input stage
+(below) and a baked AMI or persistent model server to amortise the ~230 s load.
 
-- subsetting the GFS and HRRR downloads to the region, which was previously not worth
-  doing because inference dominated, and
-- a baked AMI or a persistent model server to amortise the 210 s load.
+### Cropping the HRRR-side inputs, not just the outputs of preprocessing
 
-Cropping the *inputs* rather than the *outputs* of preprocessing is the bigger prize
-at this scale, and it is not implemented: `make_ics.py` and `make_bcs.py` still
-process the full grid.
+`SUB_BBOX` (via `run_cycle.sh` or `run_on_ec2.sh --bbox`) crops the *raw* HRRR
+GRIB2 before `make_ics.py`/`make_bcs.py` run, rather than cropping their full-domain
+`.npz` output afterward. `make_ics.py` and `make_bcs.py` are not modified:
+`src/crop_grib2.py` crops the GRIB2 files with `wgrib2 -ijsmall_grib`, which
+recomputes Section 3 (Nx, Ny, La1, Lo1) for the smaller grid the same way
+`nc2grib.py` does on the way out, and both scripts read whatever grid is actually
+in the file. Their hardcoded-1059x1799 shape check is a logged warning, never
+fatal (`src/make_ics.py:434`, `src/make_bcs.py:765`).
+
+Measured, isolated, repeated:
+
+| stage | full domain | HRRR-side crop (1.2% box) | speedup |
+|---|---|---|---|
+| `make_ics.py` | 34.7 s | 7.6-7.9 s | **4.6x** |
+| `make_bcs.py`, 1 lead hour | 34.2 s | 22.6 s | 1.5x |
+| `make_bcs.py`, 6 lead hours | 49.8 s | 30.8 s | 1.6x |
+
+`make_ics.py` scales almost with area, since it is mostly pygrib field reads over
+the grid. `make_bcs.py` scales much less, because **GFS itself is not cropped**:
+it is read once per lead hour at its native global resolution regardless of the
+HRRR-side box, and that read is now the larger share of make_bcs's cost. Only the
+xESMF regrid *target* (the cropped `--hrrr_grid_file`) got smaller. Cropping GFS
+too is the next lever and is not implemented; it needs a margin sized for the
+bilinear stencil at GFS's own (coarser) resolution, not the HRRR halo.
+
+**Verified equivalent, not merely faster.** Given the *same* cropped inputs,
+`make_ics.py`'s and `make_bcs.py`'s output is bit-identical to running them by
+hand (70 of 70 pressure/surface variables, worst diff 0). Comparing a
+raw-cropped run against the corresponding window of a full-domain run of the
+*same* cycle: worst |diff| 4.75e-5 on the IC (5 of 140 channels touched, all at
+GRIB2 repacking precision — the same 1e-5 to 1e-18 relative noise already
+measured on the raw GRIB2 fields themselves, not resampling error) and 1.96e-4 on
+the BC (a different-sized xESMF sparse matrix computes the same bilinear weights
+in a different floating-point order). Both are far below the model's own
+operating precision and the crop/noise ratios above.
+
+**LAND and OROG needed a normalization fix to get there.** `make_ics.py` falls
+back to computing a variable's mean/std *from whatever data it is given* when
+`normalize-stats.nc` lacks an entry (`src/make_ics.py:333`), which it does for
+these two constant fields. At full domain that is harmless: the CONUS land
+fraction and terrain are the same every cycle. But a raw crop's *local* land
+fraction differs from CONUS's, so before the fix, a full-domain run and a
+same-cycle crop disagreed on LAND's own normalization (0.223 in normalized
+units, the single largest discrepancy found) and OROG's (0.8, entirely from a
+domain-mean shift, not the field itself). OROG is bit-identical across every HRRR
+cycle checked; LAND varies by under 0.02% of pixels cycle to cycle (coastal/lake
+mask changes). `net-diffusion/normalize-stats.nc` now carries fixed LAND/OROG
+entries (mean/std/min/max, in the same `('stat',)` shape every other surface
+variable uses), computed once across three cycles spanning different seasons.
+This is the only change to a shipped data file this work made; it moves 2 of 140
+IC channels by at most 0.000177 for an ordinary **full-domain** run and is not
+a code change to either excluded script.
+
+**A caching hazard, handled without touching make_bcs.py.** `make_bcs.py`
+hardcodes its regridding weights filename (`gfs_to_hrrr_weights.nc`,
+`src/make_bcs.py:120`) with `reuse_weights=True`, looked up relative to whatever
+directory the process is CWD'd in. A full-domain weights file and a subdomain one
+are different shapes; xESMF fails loudly (`invalid entry in coordinates array`)
+rather than silently misregridding when they disagree, but a run that dies there
+is still a run that dies, and two different subdomain boxes collide the same way.
+`run_cycle.sh` keys a cache of weights files by the target grid actually in play
+(`WEIGHTS_KEY`, either `full` or `<height>x<width>_y<y0>_x<x0>`), stages the right
+one in before calling `make_bcs.py`, and removes the generic filename afterward so
+a later run at a different box cannot pick it up by accident.
 
 ## 6. Verifying your own crop
 
@@ -462,7 +527,8 @@ concentrated on the upwind edge would be diluted.
 
 | file | role |
 |---|---|
-| [../src/crop_domain.py](../src/crop_domain.py) | crops IC/BC npz; enforces the size rule |
+| [../src/crop_domain.py](../src/crop_domain.py) | crops IC/BC npz; enforces the size rule; also exposes `size_and_place_bbox()`, shared with crop_grib2.py |
+| [../src/crop_grib2.py](../src/crop_grib2.py) | crops the RAW HRRR GRIB2 before make_ics.py/make_bcs.py run (`wgrib2 -ijsmall_grib`) |
 | [../src/compare_domains.py](../src/compare_domains.py) | the fidelity analysis |
 | [../aws/domain_test.sh](../aws/domain_test.sh) | three-run experiment, on-instance |
 | [../aws/run_domain_test.sh](../aws/run_domain_test.sh) | launcher for the above |
@@ -470,12 +536,16 @@ concentrated on the upwind edge would be diluted.
 
 ## Experiment records
 
-The measurements in this document come from two archived experiments. Each holds the
-raw logs, the comparison JSON, figures, and the exact code state.
+The measurements in this document come from three archived experiments. Each holds
+the raw logs, the comparison JSON, figures, and the exact code state.
 
 | experiment | what it established |
 |---|---|
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-29-subdomain/` | 25.2% box: crop/noise ratio ~1, T2M cold bias, halo 20-40 cells, VRAM reading is an allocator artifact |
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-socal-a10g/` | a crop runs on a 24 GB A10G; the 1.2% SoCal box holds; the T2M bias tracks placement, not size |
+| `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-input-stage-crop/` | cropping the RAW inputs (not just the forecast) is 4.6x on `make_ics.py`, 1.5-1.6x on `make_bcs.py`; the LAND/OROG normalization fix this required |
+| `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-gpu-crop-validation/` | raw-input crop validated on real AWS GPU hardware (not just CPU) on two boxes (SoCal, PNW); ~2.1x net cycle speedup, ~9.4x on rollout; `make_bcs.py`'s 1.4x slowdown traced to instance RAM sizing the worker pool, not the crop |
 
-Read the second one's `FINDINGS.md` first: it revises two inferences from the first.
+Read the second one's `FINDINGS.md` before the first: it revises two inferences from
+it. The third documents the section 0 driver behavior above. The fourth is the first
+of these to actually run on GPU hardware rather than macOS/CPU.

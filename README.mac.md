@@ -124,6 +124,8 @@ matching `fcst.py`:
 | `NC_LSD` | `--nc_least_significant_digit` | unset (off) |
 | `S3_OUTPUT` | `--s3_output` | unset (no upload) |
 | `PURGE_LOCAL` | `--purge_local` when `YES` | `NO` |
+| `GFS_MIN_LAG` | `get_bcs.py --gfs_min_lag_hours` | `0` (newest cycle) |
+| `OVERLAP_FCST` | n/a (overlaps `fcst.py`'s model load with the input stages) | `NO` |
 
 Example (deterministic, 3-member, DEBUG logging):
 
@@ -134,6 +136,17 @@ NO_DIFFUSION=YES LOG_LEVEL=DEBUG ./run_cycle.sh 2024-05-06T23 6 3
 `LOG_LEVEL=DEBUG` emits real debug output only with the `src/utils.py`
 `setup_logging` fix (`force=True`); without it `basicConfig` is a no-op once
 TensorFlow has installed a root handler and DEBUG is silently ignored.
+
+`GFS_MIN_LAG` backs off which GFS cycle `get_bcs.py` selects: `0` (default) takes
+the newest cycle, right for a past init time where GFS has long since published.
+GFS takes ~4 h to publish while HRRR lands in ~51 min, so a run close behind a
+fresh HRRR cycle should set `GFS_MIN_LAG=4` or the input stage can fail looking
+for a GFS cycle that has not finished publishing yet.
+
+`OVERLAP_FCST=YES` starts `fcst.py` before the input stages finish, so its
+TensorFlow import and model load (~5 min, independent of the input data) overlap
+with `get_ics`/`get_bcs`/`make_ics`/`make_bcs` instead of running after them. The
+forecast blocks on a sentinel file until the inputs are ready.
 
 ### make_bcs worker cap
 
@@ -261,10 +274,10 @@ on but failed on CPU.
 The fix normalizes negative indices to positive before the gather:
 
 ```python
+time_mask = tf.constant(self.time_mask, dtype=tf.int32)
 n_channels = tf.shape(inputs)[-1]
-mask = tf.convert_to_tensor(self.time_mask, dtype=tf.int32)
-mask = tf.where(mask < 0, mask + n_channels, mask)
-time_feats = tf.gather(inputs, mask, axis=-1)
+time_mask = tf.where(time_mask < 0, time_mask + n_channels, time_mask)
+time_feats = tf.gather(inputs, time_mask, axis=-1)
 ```
 
 Properties:
@@ -335,7 +348,8 @@ Two constraints worth knowing. Sizes must satisfy `H % 8 == 3` and `W % 8 == 7`,
 the model bakes a fixed reflect-padding; `crop_domain.py` enforces this and prints the
 nearest legal sizes, and `--bbox` sizes the box for you so you never hit it. And
 `SUB_HEIGHT`/`SUB_WIDTH` must be set together: half a request is rejected rather than
-quietly running the full domain.
+quietly running the full domain. `SUB_BBOX` wins if both `SUB_BBOX` and
+`SUB_HEIGHT`/`SUB_WIDTH` are set.
 
 To inspect or place a box without running anything:
 
@@ -389,12 +403,13 @@ install_env_mac.sh      # local installer (arm64/CPU)
 environment.mac.yaml    # conda-forge env spec (osx-arm64)
 requirements.txt        # pip-style dependency reference
 etc/env_mac.sh          # env activation shim; conditional TF_USE_LEGACY_KERAS (edited)
-run_cycle.sh            # local forecast-cycle driver (fcst args + MAKE_BCS_WORKERS knobs)
+run_cycle.sh            # local forecast-cycle driver (fcst args, MAKE_BCS_WORKERS, subdomain cropping)
 src/resnet.py           # TimeCondLayer negative-index CPU/GPU fix (edited)
 src/plot.py             # per-worker logger init for macOS spawn (edited)
 src/make_bcs.py         # MAKE_BCS_WORKERS worker cap to avoid OOM (edited)
 src/utils.py            # setup_logging force=True so --log_level DEBUG applies (edited)
-src/crop_domain.py      # crop IC/BC npz to a subdomain for cheaper CPU runs (new)
+src/crop_domain.py      # crop IC/BC npz to a subdomain; SUB_HEIGHT/SUB_WIDTH path (new)
+src/crop_grib2.py       # crop raw HRRR GRIB2 before make_ics/make_bcs; SUB_BBOX path (new)
 src/compare_domains.py  # full vs subdomain fidelity check (new)
 docs/subdomain.md       # subdomain how-to and measured cost (new)
 ```

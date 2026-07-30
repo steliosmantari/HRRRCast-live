@@ -21,7 +21,8 @@
         "arn:aws:s3:::mantari-cast1/hrrrcast/out/*",
         "arn:aws:s3:::mantari-cast1/hrrrcast/logs/*",
         "arn:aws:s3:::mantari-cast1/hrrrcast/plots/*",
-        "arn:aws:s3:::mantari-cast1/hrrrcast/domain-test/*"
+        "arn:aws:s3:::mantari-cast1/hrrrcast/domain-test/*",
+        "arn:aws:s3:::mantari-cast1/hrrrcast/input-crop-test/*"
       ]
     },
     {

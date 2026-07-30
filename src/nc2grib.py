@@ -9,11 +9,16 @@ single-hour and multi-hour datasets. Per-hour writes enable overlapped I/O
 during autoregressive forecasting.
 
 Notes/assumptions:
-- Grid Definition: We require a valid GRIB2 Section 3 for the HRRRCast Lambert
-    Conformal grid. Provide via Netcdf2Grib(section3=...) constructor or set the
-    environment variable NETCDF2GRIB_SECTION3 to a .npy file. If neither is provided,
-    we auto-construct a canonical HRRR Lambert Conformal Section 3 for the full
-    3 km grid (Nx=1799, Ny=1059).
+- Grid Definition: every GRIB2 message needs a valid Section 3 for the HRRRCast
+    Lambert Conformal grid. Provide one explicitly via Netcdf2Grib(section3=...) or
+    the NETCDF2GRIB_SECTION3 environment variable (a .npy file) to pin it; that
+    pinned grid is authoritative and is never overridden by the data. Otherwise,
+    save_grib2() derives Section 3 per dataset from the dataset's own latitude/
+    longitude coordinates (see section3_from_dataset()), so a subdomain gets its
+    own Nx/Ny and first grid point rather than the full 1799x1059 CONUS grid's.
+    Only Netcdf2Grib.__init__'s fallback (for callers that drive _build_message()
+    directly, without going through save_grib2()) auto-constructs the full-grid
+    default (Nx=1799, Ny=1059).
 - Template Numbers: Product Definition Template Numbers (pdtn) and Data Representation
   Template Numbers (drtn) default to 0 (instantaneous forecast, simple packing).
   For accumulated fields (e.g., APCP), adjust pdtn and duration semantics to match
