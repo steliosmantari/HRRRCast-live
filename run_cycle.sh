@@ -98,6 +98,26 @@ NO_DIFFUSION=${NO_DIFFUSION:-NO}     # --no_diffusion when YES (deterministic mo
 # aws/pick_cycle.sh emits the value it decided on.
 GFS_MIN_LAG=${GFS_MIN_LAG:-0}
 
+# Subdomain cropping. Unset -> full 1059x1799 domain, exactly as before.
+#
+# SUB_BBOX="N,W,S,E" crops to a box containing that region plus SUB_HALO cells on
+# every side, sized and placed by src/crop_domain.py. SUB_HEIGHT/SUB_WIDTH crop to a
+# fixed grid-centred box instead; SUB_BBOX wins if both are given.
+#
+# The input stages always run at full domain, because the GFS->HRRR regridding
+# weights are fixed at 1059x1799. Only the forecast runs on the crop, which is where
+# the cost is: inference scales with H*W (9.8x faster on a 1.2% box, measured), and a
+# crop fits a 24 GB A10G where the full grid does not.
+#
+# Sizes are constrained to H % 8 == 3 and W % 8 == 7 by the model's baked
+# reflect-padding; crop_domain.py enforces it and refuses illegal sizes. See
+# docs/subdomain.md.
+SUB_BBOX=${SUB_BBOX:-}
+SUB_HALO=${SUB_HALO:-40}
+SUB_HEIGHT=${SUB_HEIGHT:-}
+SUB_WIDTH=${SUB_WIDTH:-}
+
+
 # Output/delivery knobs (defaults preserve the original local behavior).
 # GRIB2 off by default: NetCDF is what everything downstream reads, and GRIB2 adds
 # ~4 GB per cycle plus a wgrib2 dependency for no consumer in this pipeline.
@@ -120,6 +140,33 @@ FCST_FLAGS=()
 # init-time date/hour components (mirrors job-make-bcs.sh).
 DATE=${INIT_TIME%%T*}; DATE=${DATE//-/}
 HOUR=${INIT_TIME#*T}
+
+# Where the forecast reads its inputs and writes its outputs. Full-domain runs use
+# DATAROOT unchanged; a cropped run gets its own root, because fcst.py resolves inputs
+# as <base_dir>/<YYYYMMDD>/<HH>/ and both the full-domain and cropped npz would
+# otherwise collide on that one path.
+if [ -n "$SUB_BBOX" ] || { [ -n "$SUB_HEIGHT" ] && [ -n "$SUB_WIDTH" ]; }; then
+    SUBDOMAIN=YES
+    FCST_ROOT="${DATAROOT}/subrun"
+    CROP_DIR="${DATAROOT}/${DATE}/${HOUR}-sub"
+    if [ -n "$SUB_BBOX" ]; then
+        CROP_ARGS=(--bbox "$SUB_BBOX" --halo "$SUB_HALO")
+        SUB_DESC="bbox ${SUB_BBOX} + ${SUB_HALO}-cell halo"
+    else
+        CROP_ARGS=(--height "$SUB_HEIGHT" --width "$SUB_WIDTH")
+        SUB_DESC="${SUB_HEIGHT} x ${SUB_WIDTH} (grid-centred)"
+    fi
+else
+    SUBDOMAIN=NO
+    FCST_ROOT="${DATAROOT}"
+    SUB_DESC="full domain"
+    # Half a request is a mistake, not a default: silently running the full domain
+    # because only one of the two was set would waste an entire run.
+    if [ -n "$SUB_HEIGHT" ] || [ -n "$SUB_WIDTH" ]; then
+        echo "ERROR: SUB_HEIGHT and SUB_WIDTH must be set together (got '${SUB_HEIGHT}' and '${SUB_WIDTH}')." >&2
+        exit 1
+    fi
+fi
 
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -193,6 +240,28 @@ run_input_stages() {
         python3 "${PACKAGEROOT}/src/make_bcs.py" "${STATS}" "${INIT_TIME}" "${LEAD_HOUR}" \
             --base_dir "${DATAROOT}" --output_dir "${DATAROOT}" \
             --hrrr_grid_file "${DATE}/${HOUR}/hrrr_${DATE}_${HOUR}_surface.grib2"
+
+    # --- Stage 4b: crop, when a subdomain was requested ---------------------
+    # Deliberately inside run_input_stages: with OVERLAP_FCST=YES the forecast is
+    # already running and blocked on the sentinel, which is touched only after this
+    # returns. So the crop is covered by the same barrier as the input stages, and
+    # the forecast cannot start reading a half-written cropped npz.
+    if [ "$SUBDOMAIN" == "YES" ]; then
+        run_stage crop \
+            python3 "${PACKAGEROOT}/src/crop_domain.py" \
+                --in-dir "${DATAROOT}/${DATE}/${HOUR}" --out-dir "${CROP_DIR}" \
+                --init-time "${INIT_TIME}" "${CROP_ARGS[@]}"
+
+        # fcst.py resolves inputs as <base_dir>/<YYYYMMDD>/<HH>/, so the cropped npz
+        # have to sit at that path under their own root.
+        mkdir -p "${FCST_ROOT}/${DATE}/${HOUR}"
+        cp "${CROP_DIR}/hrrr_${DATE}_${HOUR}.npz" \
+           "${CROP_DIR}/gfs_${DATE}_${HOUR}.npz" \
+           "${FCST_ROOT}/${DATE}/${HOUR}/" || die "staging cropped inputs failed"
+        # Carry the crop definition next to the outputs so a consumer can tell which
+        # part of the field is product and which is halo to discard.
+        cp "${CROP_DIR}/subdomain.json" "${FCST_ROOT}/${DATE}/${HOUR}/" 2>/dev/null || true
+    fi
 }
 
 FCST_CMD=(python3 "${PACKAGEROOT}/src/fcst.py" "${MODEL}" "${INIT_TIME}" "${LEAD_HOUR}"
@@ -201,7 +270,7 @@ FCST_CMD=(python3 "${PACKAGEROOT}/src/fcst.py" "${MODEL}" "${INIT_TIME}" "${LEAD
           --pmm_alpha "${PMM_ALPHA}" --noise_rho "${NOISE_RHO}"
           --nc_complevel "${NC_COMPLEVEL}"
           ${FCST_FLAGS[@]+"${FCST_FLAGS[@]}"}
-          --base_dir "${DATAROOT}" --output_dir "${DATAROOT}")
+          --base_dir "${FCST_ROOT}" --output_dir "${FCST_ROOT}")
 
 if [ "$OVERLAP_FCST" == "YES" ]; then
     # The forecast's startup (TF import, GPU init, model load) needs no input data,
@@ -209,7 +278,7 @@ if [ "$OVERLAP_FCST" == "YES" ]; then
     # after the input stages have all succeeded, which is why the forecast waits on
     # it rather than on the npz files themselves: the files appear before they are
     # complete, so watching them would race.
-    READY="${DATAROOT}/${DATE}/${HOUR}/.inputs_ready"
+    READY="${FCST_ROOT}/${DATE}/${HOUR}/.inputs_ready"
     mkdir -p "$(dirname "$READY")"; rm -f "$READY"
 
     log "Stage: fcst (started early; will load the model, then wait for inputs)"
@@ -244,21 +313,21 @@ fi
 if [ "$RUNPLOT" == "YES" ]; then
     run_stage plot \
         python3 "${PACKAGEROOT}/src/plot.py" "${INIT_TIME}" "${LEAD_HOUR}" \
-            --members "${MEMBER_RANGE}" --forecast_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+            --members "${MEMBER_RANGE}" --forecast_dir "${FCST_ROOT}" --output_dir "${FCST_ROOT}"
 fi
 
 # --- Stage 7: ensemble PMM (+ mean/spread plot) -----------------------------
 if [ "$N_ENSEMBLES" -ge 2 ]; then
     run_stage compute-pmm \
         python3 "${PACKAGEROOT}/src/compute_pmm.py" "${INIT_TIME}" "${LEAD_HOUR}" \
-            --forecast_dir "${DATAROOT}" --output_dir "${DATAROOT}" --n_ensembles "${N_ENSEMBLES}"
+            --forecast_dir "${FCST_ROOT}" --output_dir "${FCST_ROOT}" --n_ensembles "${N_ENSEMBLES}"
 
     if [ "$RUNPLOT" == "YES" ]; then
         # non-array plot path plots the mean/spread (jobs/job-plot.sh: "avg spr")
         run_stage plot-pmm \
             python3 "${PACKAGEROOT}/src/plot.py" "${INIT_TIME}" "${LEAD_HOUR}" \
-                --members avg spr --forecast_dir "${DATAROOT}" --output_dir "${DATAROOT}"
+                --members avg spr --forecast_dir "${FCST_ROOT}" --output_dir "${FCST_ROOT}"
     fi
 fi
 
-log "Forecast cycle complete. Outputs under ${DATAROOT}/${DATE}/${HOUR}/  (logs in ${DATAROOT}/logs/)"
+log "Forecast cycle complete (${SUB_DESC}). Outputs under ${FCST_ROOT}/${DATE}/${HOUR}/  (logs in ${DATAROOT}/logs/)"

@@ -704,25 +704,44 @@ be attributed to cropping at all.
 
 ### How to run a subdomain forecast
 
-`run_on_ec2.sh` has **no** subdomain flags of its own. The crop is selected by the
-command it runs, so you pass it through `--run-cmd`, pointing at
-[run_subdomain_forecast.sh](run_subdomain_forecast.sh):
+`run_on_ec2.sh` takes **`--bbox N,W,S,E`** and **`--halo N`** directly, and passes them
+through to `run_cycle.sh` on the instance, which crops between the input stages and the
+forecast:
 
 ```bash
-aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T17 \
-    --lead-hours 24 \
-    --run-cmd "./aws/run_subdomain_forecast.sh '2026-07-29T17' '24' '' '' '35.0,-118.77,33.25,-117.0' '40'"
+aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T00 --lead-hours 24 \
+    --instance-type g5.2xlarge \
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 40
 ```
 
-The positional arguments to `run_subdomain_forecast.sh` are
-`INIT_TIME LEAD_HOURS [HEIGHT] [WIDTH] [BBOX] [HALO]`. `BBOX` is `N,W,S,E` in
-degrees and overrides `HEIGHT`/`WIDTH`: the script sizes and places a legal box that
-contains that region plus `HALO` cells on every side. Leave `BBOX` empty and pass
-`HEIGHT WIDTH` instead to crop a fixed-size box centred on the CONUS grid.
+Omit `--bbox` and the run is full-domain, exactly as before. The launcher summary and
+the instance's own summary both print the domain, so a log always says which one ran.
 
-`--init-time` and `--lead-hours` still matter on the launcher: they set the cycle the
-bootstrap stages inputs for and the S3 output prefix. Keep them consistent with the
-positional arguments in `--run-cmd`.
+This works for the **hourly schedule** too, with no Lambda change: `--stage-scheduler`
+bakes the bbox into the staged user-data template, and the Lambda only substitutes the
+init time, lead hours and GFS lag.
+
+```bash
+aws/run_on_ec2.sh --bucket mantari-cast1 --lead-hours 24 \
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --stage-scheduler
+```
+
+Re-run that to change the box; the schedule picks up the new template on its next tick.
+
+**The older path**, [run_subdomain_forecast.sh](run_subdomain_forecast.sh) via
+`--run-cmd`, still works and is what the fidelity experiments used. Prefer the flags
+above for anything new: it is one code path shared with full-domain runs, and it is the
+only one the scheduler can drive.
+
+For the older `--run-cmd` form, the positional arguments to
+`run_subdomain_forecast.sh` are `INIT_TIME LEAD_HOURS [HEIGHT] [WIDTH] [BBOX] [HALO]`,
+and they must be kept consistent with `--init-time`/`--lead-hours` on the launcher by
+hand. That duplication is the reason the flags above exist.
+
+`run_cycle.sh` also accepts the knobs directly, for a local or on-instance run:
+`SUB_BBOX="N,W,S,E"`, `SUB_HALO`, or `SUB_HEIGHT`/`SUB_WIDTH` for a fixed grid-centred
+box. `SUB_HEIGHT` and `SUB_WIDTH` must be set together; half a request is rejected
+rather than silently running the full domain.
 
 Everything else in `run_on_ec2.sh` behaves normally, including `--instance-type`,
 `--dry-run`, `--preflight-only`, `--no-terminate` and `--notify-topic`. The bootstrap

@@ -12,16 +12,51 @@ temperature**. See the "What it costs you" section for the numbers and the reaso
 
 ---
 
-## 0. The short way: give it a region and let it size the box
+## 0. The short way: name a region, run one command
 
-If you know the area you care about, do not compute grid indices by hand. Pass the
-region and a halo, and the tool sizes and places a legal box around it:
+If you know the area you care about, do not compute grid indices and do not run the
+stages by hand. Give a region and a halo to whichever driver you are already using, and
+it sizes and places a legal box for you.
+
+**Locally, or on an instance:**
+
+```bash
+SUB_BBOX=35.0,-118.77,33.25,-117.0 SUB_HALO=40 \
+    ./run_cycle.sh 2026-07-29T17 24 1 1 "$PWD" "$PWD" NO
+```
+
+**On AWS, one on-demand forecast:**
+
+```bash
+aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T17 --lead-hours 24 \
+    --instance-type g5.2xlarge \
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 40
+```
+
+**On AWS, every hour:** the same flags plus `--stage-scheduler`, which bakes the box into
+the staged user-data template. No Lambda change is needed.
+
+```bash
+aws/run_on_ec2.sh --bucket mantari-cast1 --lead-hours 24 \
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --stage-scheduler
+```
+
+All three run the input stages at full domain (the GFS-to-HRRR regridding weights are
+fixed at 1059x1799), crop, and forecast on the crop, which is where the cost is. A
+cropped run writes to its own root, `$DATAROOT/subrun/<YYYYMMDD>/<HH>/`, so cropped and
+full-domain output never collide. Use `SUB_HEIGHT`/`SUB_WIDTH` (together) for a fixed
+grid-centred box instead of a region.
+
+### Sizing or checking a box without running anything
+
+`crop_domain.py` is the piece underneath, and it is worth running on its own before you
+spend money on an instance:
 
 ```bash
 python3 src/crop_domain.py \
     --in-dir 20260729/17 --out-dir 20260729/17-socal \
     --init-time 2026-07-29T17 \
-    --bbox 35.0,-118.77,33.25,-117.0 --halo 40      # N,W,S,E
+    --bbox 35.0,-118.77,33.25,-117.0 --halo 40      # add --dry-run to only report
 ```
 
 `--bbox` overrides `--height/--width/--y0/--x0`. It finds every grid cell inside the
@@ -43,7 +78,8 @@ The box, the requested region and the achieved halo are all recorded in
 product and which is halo to discard.
 
 Read sections 1 and 2 anyway: they explain why the size rule exists and how the halo
-number was arrived at.
+number was arrived at. Sections 3 and 4 are the manual stage-by-stage sequence, useful
+for understanding what the drivers above do, and for debugging.
 
 ## 1. Pick a legal subdomain size
 
@@ -147,6 +183,25 @@ an error.
 
 `crop_domain.py` also writes `subdomain.json` recording the box, which
 `compare_domains.py` uses to align a cropped run against a full one.
+
+## 3b. Or let run_cycle.sh do it
+
+Sections 3 and 4 spell out the manual sequence. `run_cycle.sh` does exactly those steps,
+in one call, using the knobs from section 0. Two details it handles that are easy to get
+wrong by hand:
+
+- **The forecast gets its own base directory** (`$DATAROOT/subrun`), because `fcst.py`
+  resolves inputs as `<base_dir>/<YYYYMMDD>/<HH>/` and the full-domain and cropped npz
+  would otherwise collide on that one path.
+- **With `OVERLAP_FCST=YES`** the forecast starts early and blocks on a sentinel. The
+  crop runs inside the same input phase, so the sentinel is touched only after cropping
+  finishes and the forecast cannot read a half-written cropped npz.
+
+It also copies `subdomain.json` next to the outputs, and the plotting and PMM stages
+follow the forecast to `subrun` rather than reading the full-domain root.
+
+Verified bit-identical to the manual sequence: given the same cropped inputs, all 70
+variables match to 0.
 
 ## 4. Run the forecast
 
@@ -267,10 +322,26 @@ At a 1.2% box inference stops being the cost. On the A10G run: input staging ~45
 Region requested: `N 35.0, W -118.77, S 33.25, E -117.0` (roughly the LA basin
 through to San Diego and inland).
 
+To run it, end to end:
+
+```bash
+# locally (24 h, 1 member, no plots)
+SUB_BBOX=35.0,-118.77,33.25,-117.0 SUB_HALO=40 \
+    ./run_cycle.sh 2026-07-29T17 24 1 1 "$PWD" "$PWD" NO
+
+# on AWS, on the cheaper 24 GB instance a crop now fits
+aws/run_on_ec2.sh --bucket mantari-cast1 --init-time 2026-07-29T17 --lead-hours 24 \
+    --instance-type g5.2xlarge --bbox 35.0,-118.77,33.25,-117.0 --halo 40
+```
+
+To see the box it picks without running a forecast:
+
 ```bash
 python3 src/crop_domain.py --in-dir 20260729/17 --out-dir 20260729/17-socal \
-    --init-time 2026-07-29T17 --bbox 35.0,-118.77,33.25,-117.0 --halo 40
+    --init-time 2026-07-29T17 --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --dry-run
 ```
+
+which reports:
 
 | | |
 |---|---|

@@ -307,22 +307,46 @@ CPU inference at the full 1059x1799 grid is the main reason local forecasts are 
 Cropping to a subdomain cuts the per-step cost roughly in proportion to area, and it
 needs no code changes: `src/fcst.py` already takes its grid size from the input arrays.
 
-```bash
-# after the normal make_ics / make_bcs stages
-python3 src/crop_domain.py --in-dir 20260729/17 --out-dir 20260729/17-sub \
-    --init-time 2026-07-29T17 --height 531 --width 903   # 25.2% of CONUS
+One call. `run_cycle.sh` runs the input stages at full domain, crops, and forecasts on
+the crop:
 
-mkdir -p subrun/20260729/17
-cp 20260729/17-sub/{hrrr,gfs}_20260729_17.npz subrun/20260729/17/
-python3 src/fcst.py net-diffusion/model.keras 2026-07-29T17 6 \
-    --num_members 1 --members 0 --base_dir subrun --output_dir subrun
+```bash
+# a region of interest plus a 40-cell halo, sized and placed for you
+SUB_BBOX=35.0,-118.77,33.25,-117.0 SUB_HALO=40 \
+    ./run_cycle.sh 2026-07-29T17 6 1 1 "$PWD" "$PWD" NO
+
+# or a fixed grid-centred box, if you know the size you want
+SUB_HEIGHT=531 SUB_WIDTH=903 \
+    ./run_cycle.sh 2026-07-29T17 6 1 1 "$PWD" "$PWD" NO
 ```
 
-The subdomain size is constrained to `H % 8 == 3` and `W % 8 == 7`, because the model
-bakes a fixed reflect-padding; `crop_domain.py` refuses illegal sizes and suggests the
-nearest legal ones. No GRIB2 flag is needed: GRIB2 is off by default, and it now works
-correctly on a crop if you do ask for it with `--grib2` (`nc2grib.py` derives the grid
-definition from the data rather than hardcoding the full CONUS grid).
+The trailing `NO` skips plotting, which is what makes a local run finish. Outputs land
+under `subrun/<YYYYMMDD>/<HH>/`, with `subdomain.json` alongside recording the box, so
+you can tell product from halo.
+
+Measured on Apple Silicon CPU: the 1.2% Southern California box above took **18.2 s**
+for its lead hour (`predict took 18.179s`, including one-time graph setup, so steady
+state is lower), against roughly **1,720 s** per lead hour at the full grid. That is the
+difference between a local forecast being useful and being theoretical. The input stages
+still run at full domain and dominate the wall clock, so a longer forecast amortizes them
+better than a 1-hour one.
+
+Two constraints worth knowing. Sizes must satisfy `H % 8 == 3` and `W % 8 == 7`, because
+the model bakes a fixed reflect-padding; `crop_domain.py` enforces this and prints the
+nearest legal sizes, and `--bbox` sizes the box for you so you never hit it. And
+`SUB_HEIGHT`/`SUB_WIDTH` must be set together: half a request is rejected rather than
+quietly running the full domain.
+
+To inspect or place a box without running anything:
+
+```bash
+python3 src/crop_domain.py --in-dir 20260729/17 --out-dir /tmp/x \
+    --init-time 2026-07-29T17 --bbox 35.0,-118.77,33.25,-117.0 --halo 40 --dry-run
+```
+
+No GRIB2 flag is needed: GRIB2 is off by default, and it now works correctly on a crop
+if you do ask for it with `--grib2` (`nc2grib.py` derives the grid definition from the
+data rather than hardcoding the full CONUS grid).
 
 Measured fidelity cost of a 25% crop, and how much halo to leave, are in
 [docs/subdomain.md](docs/subdomain.md).

@@ -158,6 +158,11 @@ overridable through environment variables; see the script header for the full li
 `N_GPUS` is accepted only for interface parity with `submit_all.sh` and is ignored: all
 members run in one process locally, because there is no scheduler or GPU array.
 
+Set `SUB_BBOX="N,W,S,E"` (with optional `SUB_HALO`, default 40) to run the forecast on a
+cropped subdomain instead of the full 1059x1799 grid. The input stages still run at full
+domain, since the regridding weights are fixed; only inference is cropped, which is
+where the cost is. See [docs/subdomain.md](docs/subdomain.md).
+
 #### `submit_all.sh`: one forecast cycle, on SLURM
 
 The same pipeline as a chain of `sbatch` jobs with `afterok` dependencies, rendering the
@@ -183,12 +188,16 @@ aws/run_on_ec2.sh --bucket mantari-cast1 --preflight-only
 aws/run_on_ec2.sh --bucket mantari-cast1 --lead-hours 24 --wait-for-capacity 20
 ```
 
-`--dry-run` prints exactly what would happen. `--run-cmd` replaces the command the
-instance executes, which is how the subdomain path below works.
+`--bbox N,W,S,E` with `--halo N` runs the forecast on a subdomain; it works with
+`--stage-scheduler` too, so the hourly schedule can be cropped. `--dry-run` prints
+exactly what would happen. `--run-cmd` replaces the command the instance executes.
 
-#### `aws/run_subdomain_forecast.sh`: one forecast on a cropped box
+#### `aws/run_subdomain_forecast.sh`: one forecast on a cropped box (superseded)
 
-Not launched directly: it is the command you hand to `run_on_ec2.sh --run-cmd`. It runs
+Superseded by `run_on_ec2.sh --bbox`, which shares one code path with full-domain runs
+and is the only form the hourly scheduler can drive. Kept because the fidelity
+experiments used it. Not launched directly: it is the command you hand to
+`run_on_ec2.sh --run-cmd`. It runs
 the input stages once at full domain (regridding is fixed at 1059x1799), crops the
 `.npz`, and forecasts on the crop only. NetCDF only, because `src/nc2grib.py` hardcodes
 the full grid. See [docs/subdomain.md](docs/subdomain.md).
