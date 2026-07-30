@@ -171,7 +171,6 @@ run_forecast() {   # $1 = label, $2 = base dir, $3 = s3 subprefix, $4 = member i
     python3 "${REPO_DIR}/src/fcst.py" "$MODEL" "$INIT_TIME" "$LEAD_HOUR" \
         --num_members 2 --members "$member" --batch_size 1 --log_level INFO \
         --nc_complevel "$NC_COMPLEVEL" "${lsd_flag[@]}" \
-        --no_grib2 \
         --s3_output "${S3_PREFIX}/${sub}" --purge_local \
         --base_dir "$root" --output_dir "$root" \
         > "${DATAROOT}/logs/fcst-${label}.out" 2>&1

@@ -159,7 +159,10 @@ def add_forecast_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--noise-rho", "--noise_rho", dest="noise_rho", type=float, default=0.9, help="AR(1) member-noise correlation coefficient")
     parser.add_argument("--no-nudging", "--no_nudging", dest="no_nudging", action="store_true", help="Disable PMM nudging regardless of --pmm-alpha")
     parser.add_argument("--no-diffusion", "--no_diffusion", dest="no_diffusion", action="store_true", help="(TF-compat) accepted but unsupported; the PyTorch port always runs diffusion")
-    parser.add_argument("--no-grib2", "--no_grib2", dest="no_grib2", action="store_true", help="Skip GRIB2 conversion (NetCDF only)")
+    # GRIB2 is opt-in here too, matching src/fcst.py. --no-grib2 stays accepted so
+    # existing callers keep working; it is now redundant rather than an error.
+    parser.add_argument("--grib2", dest="grib2", action="store_true", help="Also write GRIB2 alongside the NetCDF (off by default)")
+    parser.add_argument("--no-grib2", "--no_grib2", dest="no_grib2", action="store_true", help="Deprecated and redundant: GRIB2 is off unless --grib2 is given")
     parser.add_argument("--compile", action="store_true", help="torch.compile the model (fuses elementwise/LayerNorm, cuts launch overhead)")
     parser.add_argument(
         "--compile-mode", "--compile_mode", dest="compile_mode",
@@ -307,7 +310,7 @@ def run_forecast(args: argparse.Namespace) -> None:
         io_executor.shutdown(wait=True)
     logger.info("Wrote %d NetCDF files under %s", len(written_nc), cycle_out)
 
-    if (not args.no_grib2) and (not bench_skip_output):
+    if args.grib2 and (not args.no_grib2) and (not bench_skip_output):
         try:
             hours = list(range(0, lead_hours + 1))
             with profile_region("torch.grib2_write", logger=logger):

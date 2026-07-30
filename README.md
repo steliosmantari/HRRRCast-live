@@ -322,7 +322,7 @@ All of these work locally too, and all default to the previous behavior:
 
 | `run_cycle.sh` env var | `src/fcst.py` argument | Default | Purpose |
 |---|---|---|---|
-| `NO_GRIB2` | `--no_grib2` | `NO` | NetCDF only; also drops the `wgrib2` dependency |
+| `NO_GRIB2` | `--grib2` when `NO` | `YES` | **GRIB2 is off by default.** Set `NO_GRIB2=NO` to also write GRIB2 (adds ~4 GB/cycle and needs `wgrib2`) |
 | `NC_COMPLEVEL` | `--nc_complevel` | `0` | NetCDF zlib level. Measured: level 1 gives 1.54x on these fields and higher levels add nothing |
 | `NC_LSD` | `--nc_least_significant_digit` | unset | **Lossy** quantization. `2` gives 3.8x for max abs error 0.0039 in native units |
 | `S3_OUTPUT` | `--s3_output` | unset | Upload each file to S3 as it is written |

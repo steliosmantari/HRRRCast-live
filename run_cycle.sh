@@ -28,7 +28,8 @@
 #   NO_DIFFUSION=NO   (YES -> --no_diffusion, deterministic model)
 #
 # Output/delivery options (defaults keep the original local behavior):
-#   NO_GRIB2=NO       (YES -> NetCDF only; drops ~4 GB/cycle and the wgrib2 dep)
+#   NO_GRIB2=YES      GRIB2 is OFF by default; set NO_GRIB2=NO to also write GRIB2
+#                     (adds ~4 GB/cycle and needs wgrib2)
 #   NC_COMPLEVEL=0    (1-9 enables NetCDF zlib compression; 0 = uncompressed.
 #                      Measured: level 1 gives 1.54x on these fields, and higher
 #                      levels add almost nothing, so 1 is the useful setting.)
@@ -98,7 +99,9 @@ NO_DIFFUSION=${NO_DIFFUSION:-NO}     # --no_diffusion when YES (deterministic mo
 GFS_MIN_LAG=${GFS_MIN_LAG:-0}
 
 # Output/delivery knobs (defaults preserve the original local behavior).
-NO_GRIB2=${NO_GRIB2:-NO}             # YES -> --no_grib2, NetCDF only
+# GRIB2 off by default: NetCDF is what everything downstream reads, and GRIB2 adds
+# ~4 GB per cycle plus a wgrib2 dependency for no consumer in this pipeline.
+NO_GRIB2=${NO_GRIB2:-YES}            # NO -> also write GRIB2 (passes --grib2)
 NC_COMPLEVEL=${NC_COMPLEVEL:-0}      # --nc_complevel; 0 = uncompressed (original behavior)
 NC_LSD=${NC_LSD:-}                   # --nc_least_significant_digit (LOSSY; empty = off)
 S3_OUTPUT=${S3_OUTPUT:-}             # s3://bucket/prefix; empty disables upload
@@ -109,7 +112,7 @@ OVERLAP_FCST=${OVERLAP_FCST:-NO}     # YES -> start fcst early so its model load
 # Assemble the store_true forecast flags (empty-array-safe under set -u).
 FCST_FLAGS=()
 [ "$NO_DIFFUSION" == "YES" ] && FCST_FLAGS+=(--no_diffusion)
-[ "$NO_GRIB2"     == "YES" ] && FCST_FLAGS+=(--no_grib2)
+[ "$NO_GRIB2"     != "YES" ] && FCST_FLAGS+=(--grib2)
 [ -n "$NC_LSD" ]             && FCST_FLAGS+=(--nc_least_significant_digit "$NC_LSD")
 [ -n "$S3_OUTPUT" ]          && FCST_FLAGS+=(--s3_output "$S3_OUTPUT")
 [ "$PURGE_LOCAL"  == "YES" ] && FCST_FLAGS+=(--purge_local)

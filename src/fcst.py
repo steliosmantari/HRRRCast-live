@@ -213,7 +213,7 @@ class WeatherForecaster:
         pmm_alpha: float = 0.65,
         diffusion_sampler: str = "dpmpp-2m",
         noise_rho: float = 0.9,
-        write_grib2: bool = True,
+        write_grib2: bool = False,
         nc_complevel: int = 0,
         nc_least_significant_digit: Optional[int] = None,
         s3_uploader: Optional["s3io.S3Uploader"] = None,
@@ -237,6 +237,9 @@ class WeatherForecaster:
         # nc_executor and the grib2 executor; list.append is atomic under the GIL, and
         # the list is only read after both have been joined.
         self.failed_uploads: List[str] = []
+        # Lead hours whose GRIB2 conversion failed. Appended from the grib2
+        # executor, whose futures are never awaited; checked after the drain.
+        self.failed_grib2: List[str] = []
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -882,7 +885,12 @@ class WeatherForecaster:
                 self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
                 logger.debug(f"Completed writing GRIB2 hour {hour} for member {member}")
             except Exception as e:
+                # Recorded, not just logged. grib2_executor.submit()'s future is never
+                # awaited, so an exception raised here would otherwise vanish into an
+                # unexamined future and the run would report success having written no
+                # GRIB2 at all. Same failure mode as the discarded upload result.
                 logger.error(f"Failed writing GRIB2 hour {hour} for member {member}: {e}")
+                self.failed_grib2.append(f"f{hour:02d} member {member}")
 
         def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
             """Build the dataset in a worker, then submit both file writes."""
@@ -1066,6 +1074,14 @@ class WeatherForecaster:
         # having delivered nothing, which is what happened when this return value was
         # ignored -- an IAM policy missing the output prefix produced two runs that
         # reported success with zero objects in S3.
+        if self.failed_grib2:
+            n = len(self.failed_grib2)
+            sample = ", ".join(self.failed_grib2[:5])
+            raise RuntimeError(
+                f"{n} GRIB2 file(s) requested by --grib2 were not written "
+                f"(first: {sample}{', ...' if n > 5 else ''}). NetCDF output is "
+                "unaffected; drop --grib2 if GRIB2 is not required.")
+
         if self.failed_uploads:
             n = len(self.failed_uploads)
             sample = ", ".join(self.failed_uploads[:5])
@@ -1181,8 +1197,17 @@ def parse_arguments():
                         help="Nudge factor toward PMM mean for member outputs (0..1)")
     parser.add_argument("--noise_rho", type=float, default=0.9,
                         help="Noise blend/correlation parameter (0..1)")
+    # GRIB2 is opt-in. NetCDF is the deliverable everything downstream reads, GRIB2
+    # roughly doubles write time and output volume, and no consumer in this pipeline
+    # needs it, so paying for it by default is wrong. --no_grib2 is still accepted
+    # because run_cycle.sh, domain_test.sh and other callers pass it; it is now
+    # redundant rather than an error.
+    parser.add_argument("--grib2", default=False, action="store_true",
+                        help="Also write GRIB2 alongside the NetCDF (requires wgrib2; "
+                             "roughly doubles output volume). Off by default")
     parser.add_argument("--no_grib2", default=False, action="store_true",
-                        help="Skip GRIB2 output and write NetCDF only (also drops the wgrib2 dependency)")
+                        help="Deprecated and redundant: GRIB2 is off unless --grib2 is given. "
+                             "Accepted for compatibility; overrides --grib2 if both appear")
     parser.add_argument("--nc_complevel", type=int, default=0, choices=range(0, 10),
                         metavar="0-9",
                         help="NetCDF zlib compression level; 0 writes uncompressed")
@@ -1335,7 +1360,7 @@ def main():
                                         static_channels=static_channels,
                                         pmm_alpha=args.pmm_alpha,
                                         noise_rho=args.noise_rho,
-                                        write_grib2=not args.no_grib2,
+                                        write_grib2=args.grib2 and not args.no_grib2,
                                         nc_complevel=args.nc_complevel,
                                         nc_least_significant_digit=args.nc_least_significant_digit,
                                         s3_uploader=uploader)

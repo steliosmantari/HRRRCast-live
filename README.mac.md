@@ -119,7 +119,7 @@ matching `fcst.py`:
 | `PMM_ALPHA` | `--pmm_alpha` | `0.7` |
 | `NOISE_RHO` | `--noise_rho` | `0.9` |
 | `NO_DIFFUSION` | `--no_diffusion` when `YES` | `NO` |
-| `NO_GRIB2` | `--no_grib2` when `YES` | `NO` |
+| `NO_GRIB2` | `--grib2` when `NO` | `YES` (GRIB2 off) |
 | `NC_COMPLEVEL` | `--nc_complevel` | `0` (uncompressed) |
 | `NC_LSD` | `--nc_least_significant_digit` | unset (off) |
 | `S3_OUTPUT` | `--s3_output` | unset (no upload) |
@@ -315,13 +315,14 @@ python3 src/crop_domain.py --in-dir 20260729/17 --out-dir 20260729/17-sub \
 mkdir -p subrun/20260729/17
 cp 20260729/17-sub/{hrrr,gfs}_20260729_17.npz subrun/20260729/17/
 python3 src/fcst.py net-diffusion/model.keras 2026-07-29T17 6 \
-    --num_members 1 --members 0 --no_grib2 --base_dir subrun --output_dir subrun
+    --num_members 1 --members 0 --base_dir subrun --output_dir subrun
 ```
 
 The subdomain size is constrained to `H % 8 == 3` and `W % 8 == 7`, because the model
 bakes a fixed reflect-padding; `crop_domain.py` refuses illegal sizes and suggests the
-nearest legal ones. Pass `--no_grib2`: `src/nc2grib.py` hardcodes the full-CONUS grid
-definition, so GRIB2 from a cropped run would be mislabelled.
+nearest legal ones. No GRIB2 flag is needed: GRIB2 is off by default, and it now works
+correctly on a crop if you do ask for it with `--grib2` (`nc2grib.py` derives the grid
+definition from the data rather than hardcoding the full CONUS grid).
 
 Measured fidelity cost of a 25% crop, and how much halo to leave, are in
 [docs/subdomain.md](docs/subdomain.md).
