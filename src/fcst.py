@@ -233,6 +233,10 @@ class WeatherForecaster:
         self.nc_complevel = nc_complevel
         self.nc_least_significant_digit = nc_least_significant_digit
         self.s3_uploader = s3_uploader
+        # Names of files S3Uploader gave up on. Appended from the single-threaded
+        # nc_executor and the grib2 executor; list.append is atomic under the GIL, and
+        # the list is only read after both have been joined.
+        self.failed_uploads: List[str] = []
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -574,8 +578,18 @@ class WeatherForecaster:
 
         # Stream off-box as soon as the file is closed, so a run that dies at
         # hour 20 still delivered hours 0-19.
+        #
+        # The return value is RECORDED, not discarded. S3Uploader.upload() returns
+        # False after exhausting its retries; ignoring that made a run whose every
+        # upload was refused (an IAM policy missing the output prefix) still exit 0
+        # and report success, having delivered nothing. Under an hourly schedule that
+        # produces empty cycles with a green status, which is the worst failure mode
+        # available. The count is checked once at the end of the rollout, so delivery
+        # failures do not abort a forecast that is still producing useful local
+        # output -- see the failed_uploads check after the drain.
         if self.s3_uploader is not None:
-            self.s3_uploader.upload(nc_path, output_dir)
+            if not self.s3_uploader.upload(nc_path, output_dir):
+                self.failed_uploads.append(nc_path.name)
 
     def write_single_hour_grib2(
         self,
@@ -619,13 +633,15 @@ class WeatherForecaster:
         logger.info(f"Wrote GRIB2 in {write_time:.3f}s : {grib2_path}")
 
         if self.s3_uploader is not None:
-            self.s3_uploader.upload(grib2_path, output_dir)
+            if not self.s3_uploader.upload(grib2_path, output_dir):
+                self.failed_uploads.append(grib2_path.name)
             # nc2grib writes a wgrib2 .idx sidecar next to the GRIB2 when wgrib2
             # is available. Ship it too; a GRIB2 delivered without its index is a
             # broken pair for consumers that expect one.
             idx_path = Path(f"{grib2_path}.idx")
             if idx_path.is_file():
-                self.s3_uploader.upload(idx_path, output_dir)
+                if not self.s3_uploader.upload(idx_path, output_dir):
+                    self.failed_uploads.append(idx_path.name)
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -1021,6 +1037,21 @@ class WeatherForecaster:
             nc_executor.shutdown(wait=True)
             grib2_executor.shutdown(wait=True)
             logger.info("All background output operations completed")
+
+        # Delivery is part of the job. Checked here, after the drain, rather than at
+        # the first failure: a forecast that is still computing correctly should finish
+        # and leave its local files behind, and per-hour streaming means an outage in
+        # the middle of a run may resolve by the end. But the process must NOT exit 0
+        # having delivered nothing, which is what happened when this return value was
+        # ignored -- an IAM policy missing the output prefix produced two runs that
+        # reported success with zero objects in S3.
+        if self.failed_uploads:
+            n = len(self.failed_uploads)
+            sample = ", ".join(self.failed_uploads[:5])
+            raise RuntimeError(
+                f"{n} file(s) were written locally but could not be uploaded to S3 "
+                f"(first: {sample}{', ...' if n > 5 else ''}). The forecast itself "
+                "completed; this is a delivery failure. Local copies were retained.")
 
         logger.info("Autoregressive rollout completed")
 
