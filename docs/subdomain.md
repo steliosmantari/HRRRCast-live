@@ -536,12 +536,14 @@ concentrated on the upwind edge would be diluted.
 
 ## Experiment records
 
-The measurements in this document come from two archived experiments. Each holds the
-raw logs, the comparison JSON, figures, and the exact code state.
+The measurements in this document come from three archived experiments. Each holds
+the raw logs, the comparison JSON, figures, and the exact code state.
 
 | experiment | what it established |
 |---|---|
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-29-subdomain/` | 25.2% box: crop/noise ratio ~1, T2M cold bias, halo 20-40 cells, VRAM reading is an allocator artifact |
 | `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-socal-a10g/` | a crop runs on a 24 GB A10G; the 1.2% SoCal box holds; the T2M bias tracks placement, not size |
+| `s3://mantari-cast1/hrrrcast/experiments/2026-07-30-input-stage-crop/` | cropping the RAW inputs (not just the forecast) is 4.6x on `make_ics.py`, 1.5-1.6x on `make_bcs.py`; the LAND/OROG normalization fix this required |
 
-Read the second one's `FINDINGS.md` first: it revises two inferences from the first.
+Read the second one's `FINDINGS.md` before the first: it revises two inferences from
+it. The third documents the section 0 driver behavior above.
