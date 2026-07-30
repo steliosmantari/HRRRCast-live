@@ -475,17 +475,22 @@ model = tf.keras.models.load_model("net-deterministic/model.keras", safe_mode=Fa
 
 ### Input/Output Dimensions
 
-The spatial grid (530×900) represents every other grid point from the original HRRR grid (1059×1799).
+The spatial grid is the **full HRRR 3 km grid, 1059×1799**. `make_ics.py` and
+`make_bcs.py` both set `downsample_factor = 1` (`src/make_ics.py:46`,
+`src/make_bcs.py:48`), so no decimation is applied and the checked-in
+`net-diffusion/model.keras` is run at full resolution.
 
-> **Note (Mantari fork).** The current configuration runs the **full 1059×1799 grid**:
-> `make_ics.py` and `make_bcs.py` both set `downsample_factor = 1`. The 530×900 figure
-> above describes a downsampled configuration that the checked-in `net-diffusion/model.keras`
-> is not run at.
->
-> Do not read 530×900 as a usable input size. The model bakes a fixed reflect-padding of
-> `[[3,2],[1,0]]` followed by three stride-2 poolings, so a valid grid must satisfy
-> `H % 8 == 3` and `W % 8 == 7` — which 530×900 does not. Cropping to a smaller domain
-> is supported and measured; see **[docs/subdomain.md](docs/subdomain.md)**.
+Upstream documentation describes a 530×900 grid, every other point of 1059×1799. That
+is a different configuration and does not apply here. It is also not a size this model
+can accept: the model bakes a fixed reflect-padding of `[[3,2],[1,0]]` followed by
+three stride-2 poolings, so a valid grid must satisfy `H % 8 == 3` and `W % 8 == 7`.
+1059 and 1799 do (1064 = 8×133, 1800 = 8×225); 530 and 900 do not.
+
+A wrong size does not fail cleanly. It misaligns the UNet skip connections after
+upsampling, which surfaces either as a shape error deep inside the model or as
+silently shifted output. To run on a smaller domain, crop rather than downsample: that
+is supported and measured, and the size rule plus how much halo to leave are covered
+in **[docs/subdomain.md](docs/subdomain.md)**.
 
 ## Data & Channels
 
