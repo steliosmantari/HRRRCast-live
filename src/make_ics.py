@@ -209,7 +209,7 @@ class GRIBPreprocessor:
                     stat_min = float(stats[2, l_idx]) if stats.shape[0] > 2 else np.nan
                     stat_max = float(stats[3, l_idx]) if stats.shape[0] > 3 else np.nan
                     norm_vals = self.normalize(vals_proc, stat_mean, stat_std)
-                    fillv = (stat_max - stat_mean) / stat_std
+                    fillv = utils.safe_fill_value(stat_mean, stat_std, stat_max, context=f"{var} level {l_idx}")
                     if isinstance(norm_vals, np.ma.MaskedArray):
                         norm_vals = norm_vals.filled(fillv)
                     norm_vals[np.isnan(norm_vals)] = fillv
@@ -337,7 +337,7 @@ class GRIBPreprocessor:
                     stat_max = np.nan
 
                 norm_vals = self.normalize(vals_proc, stat_mean, stat_std)
-                fillv = (stat_max - stat_mean) / stat_std
+                fillv = utils.safe_fill_value(stat_mean, stat_std, stat_max, context=var)
                 if isinstance(norm_vals, np.ma.MaskedArray):
                     norm_vals = norm_vals.filled(fillv)
                 norm_vals[np.isnan(norm_vals)] = fillv

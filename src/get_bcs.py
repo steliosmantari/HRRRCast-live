@@ -13,6 +13,11 @@ from typing import List, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import utils
 from utils import setup_logging, create_output_directory, download_file_with_retry
+# The cycle-selection rule and file manifest live in gfs_cycle so that AWS Lambda
+# can import them too; Lambda has neither `requests` nor `dateutil`, which utils
+# needs, so it cannot import this module. See src/gfs_cycle.py.
+from gfs_cycle import GFS_BASE_URL as _GFS_BASE_URL, gfs_cycle_for
+from gfs_cycle import get_gfs_urls as _get_gfs_urls
 
 # -------------------------------
 # Configuration
@@ -21,7 +26,7 @@ class Config:
     """Configuration class for GFS data downloader."""
     
     # Base URLs
-    GFS_BASE_URL = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
+    GFS_BASE_URL = _GFS_BASE_URL
     
     # Retry settings
     MAX_RETRIES = 3
@@ -32,83 +37,40 @@ class Config:
 # -------------------------------
 # GFS Download Functions
 # -------------------------------
-def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int) -> List[Tuple[str, str]]:
-    """Generate GFS download URLs and filenames for boundary conditions, skipping the 0th hour."""
-    urls = []
-    hour_int = int(hour)
-    cycle_hours = [0, 6, 12, 18]
-    
-    # Find the appropriate GFS cycle (must be synoptic hour for initialization)
-    if hour_int in cycle_hours:
-        init_cycle = hour_int
-        init_date_str = f"{year}{month}{day}"
-    else:
-        # Use the most recent synoptic hour
-        previous_cycle = max([c for c in cycle_hours if c < hour_int], default=18)
-        if previous_cycle >= hour_int:
-            # Need to go to previous day
-            dt = datetime(int(year), int(month), int(day)) - timedelta(days=1)
-            init_date_str = dt.strftime("%Y%m%d")
-            init_cycle = 18
-        else:
-            init_date_str = f"{year}{month}{day}"
-            init_cycle = previous_cycle
-    
-    cycle_str = f"{init_cycle:02d}"
-    
-    # Calculate forecast hours needed
-    if hour_int in cycle_hours:
-        start_forecast_hour = 0
-    else:
-        # Calculate offset from the initialization cycle
-        if init_date_str != f"{year}{month}{day}":
-            # Previous day's 18Z cycle
-            start_forecast_hour = (24 - 18) + hour_int
-        else:
-            start_forecast_hour = hour_int - init_cycle
-    
-    # Generate URLs for all forecast hours from start to start + lead_hours, skipping 0th hour
-    for fh_ in range(1, lead_hours + 1):
-        fh = fh_ + start_forecast_hour
-        forecast_str = f"{fh:03d}"
-        url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{forecast_str}"
-        
-        # Calculate valid time for this forecast hour
-        init_dt = datetime(int(init_date_str[:4]), int(init_date_str[4:6]), int(init_date_str[6:8]), init_cycle)
-        valid_dt = init_dt + timedelta(hours=fh)
-        valid_str = valid_dt.strftime("%Y%m%d_%H")
-        
-        filename = f"gfs_{valid_str}.grib2"
-        urls.append((url, filename))
+def get_gfs_urls(year: str, month: str, day: str, hour: str, lead_hours: int,
+                 gfs_min_lag_hours: int = 0) -> List[Tuple[str, str]]:
+    """Thin wrapper over gfs_cycle.get_gfs_urls that honours Config.GFS_BASE_URL.
 
-        if fh_ == lead_hours:
-            # if valid_dt is not a synoptic hour, also get the next synoptic hour file
-            if valid_dt.hour not in cycle_hours:
-                next_syn_hour = min([c for c in cycle_hours if c > valid_dt.hour], default=0)
-                if next_syn_hour == 0:
-                    next_syn_dt = valid_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                else:
-                    next_syn_dt = valid_dt.replace(hour=next_syn_hour, minute=0, second=0, microsecond=0)
-                
-                next_fh = int((next_syn_dt - init_dt).total_seconds() // 3600)
-                next_forecast_str = f"{next_fh:03d}"
-                next_url = f"{Config.GFS_BASE_URL}/gfs.{init_date_str}/{cycle_str}/atmos/gfs.t{cycle_str}z.pgrb2.0p25.f{next_forecast_str}"
-                next_valid_str = next_syn_dt.strftime("%Y%m%d_%H")
-                next_filename = f"gfs_{next_valid_str}.grib2"
-                urls.append((next_url, next_filename))
-    
-    return urls
+    The indirection is not decoration: aws/pick_cycle.sh mutates
+    Config.GFS_BASE_URL to point the availability probe at a dead path, which is
+    the only way to exercise its cycle-search fallback (every GFS cycle in the past
+    is complete). Passing the value through here keeps that hook working while the
+    rule itself stays in one place.
+    """
+    return _get_gfs_urls(year, month, day, hour, lead_hours, gfs_min_lag_hours,
+                         base_url=Config.GFS_BASE_URL)
 
-def download_gfs_files(year: str, month: str, day: str, hour: str, lead_hours: int, output_dir: Path) -> List[bool]:
+
+def download_gfs_files(year: str, month: str, day: str, hour: str, lead_hours: int, output_dir: Path,
+                       gfs_min_lag_hours: int = 0) -> List[bool]:
     """Download GFS GRIB2 files for boundary conditions."""
     logger = logging.getLogger(__name__)
-    
+
     if lead_hours == 0:
         logger.info(f"Downloading GFS data for {year}-{month}-{day} {hour}:00 UTC")
     else:
         logger.info(f"Downloading GFS boundary conditions: {year}-{month}-{day} {hour}:00 UTC + {lead_hours} hours")
-    
-    urls = get_gfs_urls(year, month, day, hour, lead_hours)
+
+    # Log the resolved cycle explicitly. Which GFS cycle backed a given forecast is
+    # not recoverable from the output later (the files are named by valid time), so
+    # without this line a run made with a non-zero lag is indistinguishable from one
+    # made with the default.
+    cycle = gfs_cycle_for(datetime(int(year), int(month), int(day), int(hour)), gfs_min_lag_hours)
+    logger.info(f"GFS cycle: {cycle:%Y-%m-%d %H}Z "
+                f"(min_lag={gfs_min_lag_hours}h, age at init "
+                f"{int((datetime(int(year), int(month), int(day), int(hour)) - cycle).total_seconds() // 3600)}h)")
+
+    urls = get_gfs_urls(year, month, day, hour, lead_hours, gfs_min_lag_hours)
     logging.info(f"Total files to download: {len(urls)}")
     for url in urls:
         logger.info(f"{url[0]} -> {url[1]}")
@@ -139,7 +101,8 @@ def download_gfs_files(year: str, month: str, day: str, hour: str, lead_hours: i
 # -------------------------------
 # Main Functions
 # -------------------------------
-def download_gfs_data(datetime_str: str, lead_hours: int, base_dir: str = "./") -> dict:
+def download_gfs_data(datetime_str: str, lead_hours: int, base_dir: str = "./",
+                      gfs_min_lag_hours: int = 0) -> dict:
     """Download GFS boundary condition data for specified date and time."""
     logger = logging.getLogger(__name__)
     
@@ -155,7 +118,8 @@ def download_gfs_data(datetime_str: str, lead_hours: int, base_dir: str = "./") 
     
     # Download GFS data
     try:
-        gfs_results = download_gfs_files(year, month, day, hour, lead_hours, output_dir)
+        gfs_results = download_gfs_files(year, month, day, hour, lead_hours, output_dir,
+                                         gfs_min_lag_hours)
         results['gfs'] = gfs_results
     except Exception as e:
         logger.error(f"Error downloading GFS data: {e}")
@@ -183,21 +147,37 @@ Examples:
     parser.add_argument('--base_dir', default='./', help='Base directory for downloads (default: ./)')
     parser.add_argument('--log_level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Set logging level (default: INFO)')
-    
+    parser.add_argument('--gfs_min_lag_hours', type=int, default=0,
+                       help='Shift GFS cycle selection back this many hours before rounding '
+                            'down to 00/06/12/18Z. 0 (default) uses the newest cycle, which is '
+                            'unavailable for 12 of 24 hours because GFS takes ~4 h to publish. '
+                            'Use 4 for a fixed hourly schedule; see gfs_cycle_for().')
+
     args = parser.parse_args()
-    
+
     # Setup logging
     logger = setup_logging(args.log_level)
-    
+
     # Validate lead_hours
     if args.lead_hours < 0:
         logger.error("Lead hours must be >= 0")
         sys.exit(1)
-    
+
+    # A negative lag would ask for a cycle that does not exist yet. The upper bound
+    # allows deliberately skipping whole cycles: aws/pick_cycle.sh steps back a full
+    # 6 h at a time when the newest usable cycle turns out to be incomplete on S3,
+    # and expresses the cycle it settled on as a lag. 23 h is the point past which
+    # GFS forecast hours would exceed f047 for a 24 h run, well outside anything the
+    # network has seen.
+    if not 0 <= args.gfs_min_lag_hours <= 23:
+        logger.error("--gfs_min_lag_hours must be between 0 and 23 "
+                     "(negative asks for a future cycle; >23 leaves the trained range)")
+        sys.exit(1)
+
     try:
         # Download GFS data
         results = download_gfs_data(
-            args.inittime, args.lead_hours, args.base_dir
+            args.inittime, args.lead_hours, args.base_dir, args.gfs_min_lag_hours
         )
         
         # Summary

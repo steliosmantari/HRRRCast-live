@@ -272,7 +272,7 @@ def process_single_lead_hour(args):
                 stat_min = np.nan
                 stat_max = np.nan
             norm_vals = preprocessor.normalize(proc_vals, stat_mean, stat_std)
-            fillv = (stat_max - stat_mean) / stat_std
+            fillv = utils.safe_fill_value(stat_mean, stat_std, stat_max, context=f"{mapping['cfg']}-{l_idx}")
             if isinstance(norm_vals, np.ma.MaskedArray):
                 norm_vals = norm_vals.filled(fillv)
             norm_vals[np.isnan(norm_vals)] = fillv
@@ -403,7 +403,7 @@ def process_single_lead_hour(args):
             stat_max = np.nan
 
         norm_vals = preprocessor.normalize(proc_vals, stat_mean, stat_std)
-        fillv = (stat_max - stat_mean) / stat_std
+        fillv = utils.safe_fill_value(stat_mean, stat_std, stat_max, context=mapping['cfg'])
         if isinstance(norm_vals, np.ma.MaskedArray):
             norm_vals = norm_vals.filled(fillv)
         norm_vals[np.isnan(norm_vals)] = fillv

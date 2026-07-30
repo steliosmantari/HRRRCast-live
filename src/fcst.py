@@ -233,6 +233,10 @@ class WeatherForecaster:
         self.nc_complevel = nc_complevel
         self.nc_least_significant_digit = nc_least_significant_digit
         self.s3_uploader = s3_uploader
+        # Names of files S3Uploader gave up on. Appended from the single-threaded
+        # nc_executor and the grib2 executor; list.append is atomic under the GIL, and
+        # the list is only read after both have been joined.
+        self.failed_uploads: List[str] = []
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -574,8 +578,18 @@ class WeatherForecaster:
 
         # Stream off-box as soon as the file is closed, so a run that dies at
         # hour 20 still delivered hours 0-19.
+        #
+        # The return value is RECORDED, not discarded. S3Uploader.upload() returns
+        # False after exhausting its retries; ignoring that made a run whose every
+        # upload was refused (an IAM policy missing the output prefix) still exit 0
+        # and report success, having delivered nothing. Under an hourly schedule that
+        # produces empty cycles with a green status, which is the worst failure mode
+        # available. The count is checked once at the end of the rollout, so delivery
+        # failures do not abort a forecast that is still producing useful local
+        # output -- see the failed_uploads check after the drain.
         if self.s3_uploader is not None:
-            self.s3_uploader.upload(nc_path, output_dir)
+            if not self.s3_uploader.upload(nc_path, output_dir):
+                self.failed_uploads.append(nc_path.name)
 
     def write_single_hour_grib2(
         self,
@@ -619,13 +633,15 @@ class WeatherForecaster:
         logger.info(f"Wrote GRIB2 in {write_time:.3f}s : {grib2_path}")
 
         if self.s3_uploader is not None:
-            self.s3_uploader.upload(grib2_path, output_dir)
+            if not self.s3_uploader.upload(grib2_path, output_dir):
+                self.failed_uploads.append(grib2_path.name)
             # nc2grib writes a wgrib2 .idx sidecar next to the GRIB2 when wgrib2
             # is available. Ship it too; a GRIB2 delivered without its index is a
             # broken pair for consumers that expect one.
             idx_path = Path(f"{grib2_path}.idx")
             if idx_path.is_file():
-                self.s3_uploader.upload(idx_path, output_dir)
+                if not self.s3_uploader.upload(idx_path, output_dir):
+                    self.failed_uploads.append(idx_path.name)
 
     def get_variable_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -905,8 +921,19 @@ class WeatherForecaster:
             submit_with_backpressure(0, state_from_hour[member], member)
 
         # phase shift of GFS forcing input
+        #
+        # members_sorted must be the ACTUAL member IDs being run, not range(n).
+        # phase_angle is looked up below as phase_angle[member], so keying it by
+        # position broke any run whose member IDs are not 0..n-1: `--members 1` with
+        # num_members=1 built {0: 0.0} and then raised KeyError(1) at the first
+        # rollout hour. Because str(KeyError(1)) is just "1", the log read
+        # "Forecast failed: 1", which looks like an exit status rather than a missing
+        # dict key and is genuinely hard to place.
+        #
+        # self.num_members is still used for the phase spacing, so a member subset of
+        # a larger planned ensemble keeps the spread it would have had.
         num_members = self.num_members
-        members_sorted = list(range(num_members))
+        members_sorted = sorted(self.members)
         half_count = (num_members // 2 - ((num_members + 1) % 2)) # Half count for symmetry
         step = 1.0 / half_count if half_count > 0 else 0.0
         seq = []
@@ -916,7 +943,17 @@ class WeatherForecaster:
         for i in range(half_count):
             seq.append(step * (i + 1))  # Positive phase shifts
             seq.append(-step * (i + 1))  # Negative phase shifts
-        phase_angle = {member: seq[i] for i, member in enumerate(members_sorted)}
+        # Index seq by the member's OWN id, not by its position in this run's subset.
+        # seq has exactly num_members entries by construction, and a member's phase is
+        # a property of the member, so `--members 3` out of 5 must get the same phase
+        # it would get in a full 5-member run. Keying by subset position would make a
+        # single-member rerun silently disagree with the ensemble it came from.
+        if any(m >= num_members for m in members_sorted):
+            raise ValueError(
+                f"member id(s) {[m for m in members_sorted if m >= num_members]} are "
+                f">= --num_members ({num_members}); phase shifts are only defined for "
+                f"ids 0..{num_members - 1}. Raise --num_members to match.")
+        phase_angle = {member: seq[member] for member in members_sorted}
 
         # rollout hour
         rollout_hour = 6
@@ -1021,6 +1058,21 @@ class WeatherForecaster:
             nc_executor.shutdown(wait=True)
             grib2_executor.shutdown(wait=True)
             logger.info("All background output operations completed")
+
+        # Delivery is part of the job. Checked here, after the drain, rather than at
+        # the first failure: a forecast that is still computing correctly should finish
+        # and leave its local files behind, and per-hour streaming means an outage in
+        # the middle of a run may resolve by the end. But the process must NOT exit 0
+        # having delivered nothing, which is what happened when this return value was
+        # ignored -- an IAM policy missing the output prefix produced two runs that
+        # reported success with zero objects in S3.
+        if self.failed_uploads:
+            n = len(self.failed_uploads)
+            sample = ", ".join(self.failed_uploads[:5])
+            raise RuntimeError(
+                f"{n} file(s) were written locally but could not be uploaded to S3 "
+                f"(first: {sample}{', ...' if n > 5 else ''}). The forecast itself "
+                "completed; this is a delivery failure. Local copies were retained.")
 
         logger.info("Autoregressive rollout completed")
 

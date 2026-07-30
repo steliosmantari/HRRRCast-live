@@ -301,6 +301,31 @@ them to the GPU/HPC checkouts.
 For production or timely forecasts, use the HPC/GPU path in the main README. The
 local path is intended for development, preprocessing, and small validation runs.
 
+### Cropping the domain makes local runs practical
+
+CPU inference at the full 1059x1799 grid is the main reason local forecasts are slow.
+Cropping to a subdomain cuts the per-step cost roughly in proportion to area, and it
+needs no code changes: `src/fcst.py` already takes its grid size from the input arrays.
+
+```bash
+# after the normal make_ics / make_bcs stages
+python3 src/crop_domain.py --in-dir 20260729/17 --out-dir 20260729/17-sub \
+    --init-time 2026-07-29T17 --height 531 --width 903   # 25.2% of CONUS
+
+mkdir -p subrun/20260729/17
+cp 20260729/17-sub/{hrrr,gfs}_20260729_17.npz subrun/20260729/17/
+python3 src/fcst.py net-diffusion/model.keras 2026-07-29T17 6 \
+    --num_members 1 --members 0 --no_grib2 --base_dir subrun --output_dir subrun
+```
+
+The subdomain size is constrained to `H % 8 == 3` and `W % 8 == 7`, because the model
+bakes a fixed reflect-padding; `crop_domain.py` refuses illegal sizes and suggests the
+nearest legal ones. Pass `--no_grib2`: `src/nc2grib.py` hardcodes the full-CONUS grid
+definition, so GRIB2 from a cropped run would be mislabelled.
+
+Measured fidelity cost of a 25% crop, and how much halo to leave, are in
+[docs/subdomain.md](docs/subdomain.md).
+
 ## Troubleshooting (Local)
 
 - **`Segmentation fault` on `import tensorflow` or during solve**: usually a
@@ -344,4 +369,7 @@ src/resnet.py           # TimeCondLayer negative-index CPU/GPU fix (edited)
 src/plot.py             # per-worker logger init for macOS spawn (edited)
 src/make_bcs.py         # MAKE_BCS_WORKERS worker cap to avoid OOM (edited)
 src/utils.py            # setup_logging force=True so --log_level DEBUG applies (edited)
+src/crop_domain.py      # crop IC/BC npz to a subdomain for cheaper CPU runs (new)
+src/compare_domains.py  # full vs subdomain fidelity check (new)
+docs/subdomain.md       # subdomain how-to and measured cost (new)
 ```

@@ -32,6 +32,10 @@
 #   --region REGION        AWS region                   [us-east-1]
 #   --code-s3 URI          override where the code tarball is staged
 #                          [s3://BUCKET/hrrrcast/code/<sha>-<timestamp>.tar.gz]
+#   --stage-scheduler      pin the code tarball and a user-data template to S3 for
+#                          the hourly Lambda, then exit without launching. This is
+#                          the deploy step for unattended operation; re-run it to
+#                          roll out a code change. See aws/deploy_scheduler.sh.
 #   --model-s3 URI         model.keras location         [s3://BUCKET/hrrrcast/model.keras]
 #   --nc-complevel N       NetCDF zlib level, 0-9       [1]
 #   --nc-lsd N             LOSSY quantization digits    [2; pass "" for lossless]
@@ -93,6 +97,12 @@ MAKE_BCS_WORKERS=auto
 # Empty = no notification. Set to an SNS topic ARN (or export HRRRCAST_SNS_TOPIC)
 # to get an email summary when a run ends, success or failure.
 SNS_TOPIC="${HRRRCAST_SNS_TOPIC:-}"
+# How far back to shift GFS cycle selection before rounding to 00/06/12/18Z.
+# 0 keeps the newest cycle, matching every run so far. It is the right default for
+# an on-demand run of a past cycle, where all the data is long since published.
+# aws/pick_cycle.sh emits GFS_MIN_LAG=4 for real-time hourly operation, where the
+# newest cycle has not finished publishing yet. See src/get_bcs.py gfs_cycle_for().
+GFS_MIN_LAG="${GFS_MIN_LAG:-0}"
 TERMINATE="YES"
 DRY_RUN="NO"
 # GPU capacity comes and goes: g6e.2xlarge launched fine in us-east-1b and was
@@ -100,6 +110,13 @@ DRY_RUN="NO"
 WAIT_CAPACITY_MIN=0
 WAIT_CAPACITY_INTERVAL=120
 PREFLIGHT_ONLY="NO"
+# Deploy-time staging for the hourly scheduler (see the --stage-scheduler block).
+STAGE_SCHEDULER="NO"
+# Command the instance runs once its env is ready. Default reproduces the original
+# behavior; --run-cmd swaps in an experiment (see aws/run_domain_test.sh). Rendered
+# into user_data.sh at @[RUN_CMD], so it must be a single valid shell statement and
+# must not contain @[...] sequences of its own.
+RUN_CMD=""
 
 log() { printf '\n\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\n\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -122,10 +139,13 @@ while [ $# -gt 0 ]; do
         --model-s3)            MODEL_S3="$2"; shift 2 ;;
         --nc-complevel)        NC_COMPLEVEL="$2"; shift 2 ;;
         --nc-lsd)              NC_LSD="$2"; shift 2 ;;
+        --gfs-min-lag)         GFS_MIN_LAG="$2"; shift 2 ;;
         --make-bcs-workers)    MAKE_BCS_WORKERS="$2"; shift 2 ;;
         --notify-topic)        SNS_TOPIC="$2"; shift 2 ;;
         --wait-for-capacity)   WAIT_CAPACITY_MIN="$2"; shift 2 ;;
         --preflight-only)      PREFLIGHT_ONLY="YES"; shift ;;
+        --stage-scheduler)     STAGE_SCHEDULER="YES"; shift ;;
+        --run-cmd)             RUN_CMD="$2"; shift 2 ;;
         --no-terminate)        TERMINATE="NO"; shift ;;
         --dry-run)             DRY_RUN="YES"; shift ;;
         -h|--help)             sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d'; exit 0 ;;
@@ -285,6 +305,10 @@ rm -f "$CODE_TARBALL"
 # --- render user-data ------------------------------------------------------
 # atparse aborts on undefined @[VAR], so every placeholder must be set here.
 RUN_USER="ubuntu"
+if [ -z "$RUN_CMD" ]; then
+    RUN_CMD="./run_cycle.sh '${INIT_TIME}' '${LEAD_HOUR}' '${N_ENSEMBLES}' 1 \"\$WORKDIR\" \"\$WORKDIR\" NO"
+fi
+case "$RUN_CMD" in *'@['*) die "--run-cmd must not contain @[...]; atparse would try to expand it." ;; esac
 USER_DATA_FILE="$(mktemp -t hrrrcast-userdata)"
 # shellcheck disable=SC1091
 source "${REPO_DIR}/atparse.bash"
@@ -294,7 +318,7 @@ atparse \
     CODE_S3="$CODE_S3" CODE_REF="$CODE_REF" MODEL_S3="$MODEL_S3" \
     RUN_USER="$RUN_USER" NC_COMPLEVEL="$NC_COMPLEVEL" NC_LSD="$NC_LSD" \
     MAKE_BCS_WORKERS="$MAKE_BCS_WORKERS" TERMINATE="$TERMINATE" \
-    SNS_TOPIC="$SNS_TOPIC" \
+    SNS_TOPIC="$SNS_TOPIC" GFS_MIN_LAG="$GFS_MIN_LAG" RUN_CMD="$RUN_CMD" \
     < "${REPO_DIR}/aws/user_data.sh" > "$USER_DATA_FILE"
 
 bash -n "$USER_DATA_FILE" || die "Rendered user-data is not valid bash (template bug)."
@@ -312,6 +336,7 @@ cat <<EOF
   outputs          ${S3_OUTPUT}/<YYYYMMDD>/<HH>/
   logs             ${S3_LOGS}/
   netcdf           complevel=${NC_COMPLEVEL} lsd=${NC_LSD:-off}
+  gfs cycle lag    ${GFS_MIN_LAG} h
   grib2            disabled
   plots            separate job (aws/run_plots.sh)
   self-terminate   ${TERMINATE}
@@ -322,6 +347,92 @@ if [ "$DRY_RUN" == "YES" ]; then
     log "Dry run: rendered user-data follows; nothing was launched"
     cat "$USER_DATA_FILE"
     rm -f "$USER_DATA_FILE"
+    exit 0
+fi
+
+# --- deploy-time staging for the hourly scheduler --------------------------
+# --stage-scheduler makes this script the DEPLOY half of the unattended path,
+# and stops before launching anything.
+#
+# The problem it solves: this script packages the local working tree on every
+# invocation, which is right for on-demand development and wrong for a scheduler.
+# An hourly Lambda has no checkout, and even if it did, shipping "whatever is in
+# the tree" 24 times a day is not a thing you want. So the code tarball and the
+# rendered user-data are pinned ONCE here, and the Lambda only substitutes the
+# three values that vary per run.
+#
+# Those three are rendered as __INIT_TIME__, __LEAD_HOUR__ and __GFS_MIN_LAG__
+# rather than left as @[VAR], because atparse aborts on any placeholder it was
+# not given a value for. Passing sentinels through atparse keeps the template
+# path identical to the interactive one, including the `bash -n` check below, so
+# a template bug cannot reach the scheduler without also breaking normal runs.
+if [ "$STAGE_SCHEDULER" == "YES" ]; then
+    STAGE_PREFIX="s3://${BUCKET}/hrrrcast/scheduler"
+    TEMPLATE_FILE="$(mktemp -t hrrrcast-udtemplate)"
+    atparse \
+        INIT_TIME="__INIT_TIME__" LEAD_HOUR="__LEAD_HOUR__" N_ENSEMBLES="$N_ENSEMBLES" \
+        S3_OUTPUT="$S3_OUTPUT" S3_LOGS="$S3_LOGS" \
+        CODE_S3="$CODE_S3" CODE_REF="$CODE_REF" MODEL_S3="$MODEL_S3" \
+        RUN_USER="$RUN_USER" NC_COMPLEVEL="$NC_COMPLEVEL" NC_LSD="$NC_LSD" \
+        MAKE_BCS_WORKERS="$MAKE_BCS_WORKERS" TERMINATE="$TERMINATE" \
+        SNS_TOPIC="$SNS_TOPIC" GFS_MIN_LAG="__GFS_MIN_LAG__" RUN_CMD="$RUN_CMD" \
+        < "${REPO_DIR}/aws/user_data.sh" > "$TEMPLATE_FILE"
+
+    # The template still has to be valid bash with the sentinels in place, since
+    # the Lambda only does string substitution and never re-validates.
+    bash -n "$TEMPLATE_FILE" || die "Rendered user-data template is not valid bash (template bug)."
+    for sentinel in __INIT_TIME__ __LEAD_HOUR__ __GFS_MIN_LAG__; do
+        grep -q "$sentinel" "$TEMPLATE_FILE" \
+            || die "sentinel ${sentinel} is absent from the template; user_data.sh no longer references it."
+    done
+    grep -q '@\[' "$TEMPLATE_FILE" \
+        && die "template still contains unexpanded @[...] placeholders."
+
+    # Launch parameters the Lambda would otherwise have to hardcode. Resolved here,
+    # where the AMI lookup and subnet discovery already happened.
+    PARAMS_FILE="$(mktemp -t hrrrcast-params)"
+    cat > "$PARAMS_FILE" <<EOF
+{
+  "region": "${REGION}",
+  "image_id": "${AMI_ID}",
+  "instance_type": "${INSTANCE_TYPE}",
+  "instance_profile": "${INSTANCE_PROFILE}",
+  "volume_size": ${VOLUME_SIZE},
+  "security_group_ids": "${SECURITY_GROUP_IDS}",
+  "s3_output": "${S3_OUTPUT}",
+  "s3_logs": "${S3_LOGS}",
+  "code_ref": "${CODE_REF}",
+  "code_s3": "${CODE_S3}",
+  "lead_hours": ${LEAD_HOUR},
+  "gfs_min_lag": ${GFS_MIN_LAG},
+  "n_ensembles": ${N_ENSEMBLES},
+  "user_data_template": "${STAGE_PREFIX}/user_data.template",
+  "staged_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+    python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$PARAMS_FILE" \
+        || die "generated launch-params JSON is invalid"
+
+    log "Staging scheduler artifacts to ${STAGE_PREFIX}/"
+    aws s3 cp "$TEMPLATE_FILE" "${STAGE_PREFIX}/user_data.template" --quiet \
+        || die "user-data template upload failed"
+    aws s3 cp "$PARAMS_FILE" "${STAGE_PREFIX}/launch-params.json" --quiet \
+        || die "launch-params upload failed"
+
+    cat <<EOF
+
+  Staged for the hourly scheduler:
+    code         ${CODE_S3}
+    code ref     ${CODE_REF}
+    template     ${STAGE_PREFIX}/user_data.template
+    params       ${STAGE_PREFIX}/launch-params.json
+    lead hours   ${LEAD_HOUR}
+    gfs min lag  ${GFS_MIN_LAG}
+
+  The Lambda reads both objects at every invocation, so re-running
+  --stage-scheduler is how you roll out a code change. Nothing was launched.
+EOF
+    rm -f "$TEMPLATE_FILE" "$PARAMS_FILE" "$USER_DATA_FILE"
     exit 0
 fi
 

@@ -112,7 +112,7 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
         prev_url = f"{Config.HRRR_BASE_URL}/hrrr.{prev_cycle_date}/conus/hrrr.t{prev_hour}z.wrfsfcf01.grib2"
         prev_filename = f"hrrr_{prev_cycle_date}_{prev_hour}_surface_f01.grib2"
         prev_path = output_dir / prev_filename
-        if not prev_path.exists():
+        if not utils.file_looks_valid(prev_path):
             logger.info(f"Downloading previous hour surface 1h forecast (APCP source) into current directory from {prev_url}")
             results['prev_hour_surface_f01'] = download_file_with_retry(prev_url, str(prev_path))
         else:
@@ -131,7 +131,7 @@ def download_hrrr_data(datetime_str: str, base_dir: str = "{DATAROOT}/") -> dict
         prev_prs_url = f"{Config.HRRR_BASE_URL}/hrrr.{prev_cycle_date}/conus/hrrr.t{prev_hour}z.wrfprsf01.grib2"
         prev_prs_filename = f"hrrr_{prev_cycle_date}_{prev_hour}_pressure_f01.grib2"
         prev_prs_path = output_dir / prev_prs_filename
-        if not prev_prs_path.exists():
+        if not utils.file_looks_valid(prev_prs_path):
             logger.info(f"Downloading previous hour pressure 1h forecast (VVEL source) into current directory from {prev_prs_url}")
             results['prev_hour_pressure_f01'] = download_file_with_retry(prev_prs_url, str(prev_prs_path))
         else:

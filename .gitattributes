@@ -1,0 +1,5 @@
+# The pretrained models are Git LFS objects. Without this file the LFS clean
+# filter never runs, so a smudged working copy looks like a 203 MB modification
+# of a 134-byte pointer blob and "git add" would commit the raw binary into git
+# history, permanently. Both model paths in this repo history are LFS.
+*.keras filter=lfs diff=lfs merge=lfs -text
