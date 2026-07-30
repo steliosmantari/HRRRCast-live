@@ -921,11 +921,20 @@ Two limits of this path as it stands:
   derived from the dataset's own coordinates, verified by decoding the output back and
   comparing against the NetCDF. A GRIB2 conversion that fails now fails the run instead
   of logging a warning nobody reads.
-- **The input stages always run at full domain.** The regridding weights are fixed at
-  1059x1799, so `get_*`/`make_*` cost the same as a full run (about 417 s measured).
-  At a small crop that fixed cost, plus a ~210 s model load, dominates the wall clock,
-  and inference is only a few percent of it. Cropping the input stage, or a baked AMI,
-  is where the next saving is.
+- **The input stages now crop too, when `--bbox` is a region (not `SUB_HEIGHT`/
+  `SUB_WIDTH`).** `run_cycle.sh` crops the raw HRRR GRIB2 (`src/crop_grib2.py`,
+  `wgrib2 -ijsmall_grib`) before `make_ics.py`/`make_bcs.py` run, rather than
+  cropping their full-domain output afterward. Measured, isolated: `make_ics.py`
+  4.6x faster, `make_bcs.py` 1.5-1.6x faster (less, because GFS itself is not
+  cropped and its per-lead-hour read is now the larger share of that stage's
+  cost). Neither script was modified: they read whatever grid is actually in the
+  file, and their hardcoded-1059x1799 shape check is a logged warning, never
+  fatal. See [../docs/subdomain.md](../docs/subdomain.md) for the equivalence
+  verification and the `normalize-stats.nc` fix it required (LAND/OROG
+  normalization was computed on-the-fly from whatever data was given, which
+  disagreed between a full-domain run and a same-cycle crop until fixed values
+  were added). At a small crop, the model load (~230 s) is now the dominant
+  remaining fixed cost; a baked AMI or persistent model server is the next lever.
 
 ## What this does not do
 
@@ -948,6 +957,7 @@ specific point:
 | [iam/lambda-launcher-policy.json](iam/lambda-launcher-policy.json) | launcher permissions; `RunInstances` split across resource types on purpose |
 | [../src/gfs_cycle.py](../src/gfs_cycle.py) | GFS cycle rule + input manifest, stdlib-only so Lambda can import it |
 | [../src/crop_domain.py](../src/crop_domain.py) | crops IC/BC npz to a subdomain; enforces the `H%8==3, W%8==7` rule |
+| [../src/crop_grib2.py](../src/crop_grib2.py) | crops the RAW HRRR GRIB2 before make_ics.py/make_bcs.py run, used by `--bbox` |
 | [../src/compare_domains.py](../src/compare_domains.py) | full vs subdomain fidelity, against a stochastic-noise yardstick |
 | [run_subdomain_forecast.sh](run_subdomain_forecast.sh) | one production forecast on a cropped box; drive it with `run_on_ec2.sh --run-cmd` |
 | [domain_test.sh](domain_test.sh) | three-forecast subdomain experiment, run on the instance |
