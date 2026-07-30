@@ -58,6 +58,11 @@ NC_LSD="${NC_LSD:-2}"
 GFS_MIN_LAG="${GFS_MIN_LAG:-0}"
 S3_OUTPUT="${S3_OUTPUT:-}"
 PURGE_LOCAL="${PURGE_LOCAL:-NO}"
+# GRIB2 now works on a crop (nc2grib derives Section 3 from the data), but the
+# default stays YES to match every other AWS run: user_data.sh exports
+# NO_GRIB2=YES, so that wins whenever this script is driven through
+# run_on_ec2.sh --run-cmd. Set NO_GRIB2=NO to get GRIB2 alongside the NetCDF;
+# it roughly quadruples output volume.
 NO_GRIB2="${NO_GRIB2:-YES}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"

@@ -237,6 +237,9 @@ class WeatherForecaster:
         # nc_executor and the grib2 executor; list.append is atomic under the GIL, and
         # the list is only read after both have been joined.
         self.failed_uploads: List[str] = []
+        # Lead hours whose GRIB2 conversion failed. Appended from the grib2
+        # executor, whose futures are never awaited; checked after the drain.
+        self.failed_grib2: List[str] = []
 
         # log-transform variables list
         self.LOG_TRANSFORM_VARS = [
@@ -882,7 +885,12 @@ class WeatherForecaster:
                 self.write_single_hour_grib2(init_datetime, hour, ds_hour, output_dir, member)
                 logger.debug(f"Completed writing GRIB2 hour {hour} for member {member}")
             except Exception as e:
+                # Recorded, not just logged. grib2_executor.submit()'s future is never
+                # awaited, so an exception raised here would otherwise vanish into an
+                # unexamined future and the run would report success having written no
+                # GRIB2 at all. Same failure mode as the discarded upload result.
                 logger.error(f"Failed writing GRIB2 hour {hour} for member {member}: {e}")
+                self.failed_grib2.append(f"f{hour:02d} member {member}")
 
         def build_and_submit_hour_outputs(hour: int, data: np.ndarray, member: int) -> None:
             """Build the dataset in a worker, then submit both file writes."""
@@ -1066,6 +1074,14 @@ class WeatherForecaster:
         # having delivered nothing, which is what happened when this return value was
         # ignored -- an IAM policy missing the output prefix produced two runs that
         # reported success with zero objects in S3.
+        if self.failed_grib2:
+            n = len(self.failed_grib2)
+            sample = ", ".join(self.failed_grib2[:5])
+            raise RuntimeError(
+                f"{n} GRIB2 file(s) requested by --grib2 were not written "
+                f"(first: {sample}{', ...' if n > 5 else ''}). NetCDF output is "
+                "unaffected; re-run with --no_grib2 if GRIB2 is not required.")
+
         if self.failed_uploads:
             n = len(self.failed_uploads)
             sample = ", ".join(self.failed_uploads[:5])

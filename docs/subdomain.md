@@ -159,14 +159,27 @@ cp 20260729/17-sub/{hrrr,gfs}_20260729_17.npz subrun/20260729/17/
 
 python3 src/fcst.py net-diffusion/model.keras 2026-07-29T17 24 \
     --num_members 1 --members 0 --batch_size 1 \
-    --nc_complevel 1 --nc_least_significant_digit 2 --no_grib2 \
+    --nc_complevel 1 --nc_least_significant_digit 2 \
     --base_dir subrun --output_dir subrun
 ```
 
-**GRIB2 output does not work on a subdomain.** `src/nc2grib.py` builds GRIB2 Section 3
-from hardcoded `Nx=1799, Ny=1059`, so the grid definition would describe the full
-CONUS grid while the data covers the crop. Pass `--no_grib2`. Fixing this means
-deriving Section 3 from the actual array shape and the cropped corner coordinates.
+**GRIB2 output works on a subdomain.** It did not until 2026-07-30: `nc2grib.py`
+built Section 3 from a hardcoded `Nx=1799, Ny=1059` *and* a hardcoded first grid point,
+so a crop was rejected by grib2io with a shape mismatch and no file was produced.
+Section 3 is now derived from the dataset's own `latitude`/`longitude`: only the number
+of data points, `Nx`, `Ny`, `La1` and `Lo1` depend on the domain, and everything else
+(`LoV`, `LaD`, `Latin1/2`, `Dx/Dy`, earth shape, scanning mode) is a property of the
+projection and invariant under cropping.
+
+Verified by round-trip: writing GRIB2 from a 155x151 crop and decoding it back with
+grib2io reproduces the NetCDF latitudes and longitudes exactly, and the full-domain
+Section 3 is bit-identical to what the old hardcoded path produced.
+
+Note that GRIB2 is still off by default on AWS: `aws/user_data.sh` exports
+`NO_GRIB2=YES` for every run, full domain included, and that is unchanged. Pass
+`NO_GRIB2=NO` if you want it, bearing in mind it roughly quadruples output volume
+(a 155x151 crop writes 4.1 MB of GRIB2 per lead hour against 5.5 MB of NetCDF, but a
+full-domain hour is 324 MB against 435 MB).
 
 ## 5. What it costs you
 

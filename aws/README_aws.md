@@ -15,7 +15,7 @@ Current shape:
 | measured throughput | ~35.5 s per lead hour steady state |
 | a 24 h forecast | ~28 min, ~$1.06, ~10.3 GB of NetCDF |
 | deliverable | NetCDF to S3, one file per lead hour |
-| GRIB2 | disabled (`NO_GRIB2=YES`) |
+| GRIB2 | disabled (`user_data.sh` exports `NO_GRIB2=YES` for every AWS run) |
 | plots | separate job, off the critical path (`aws/run_plots.sh`) |
 | notifications | optional email on completion via SNS (`--notify-topic`) |
 | retention | 12-day S3 expiry; the staged model never expires |
@@ -751,8 +751,12 @@ squeeze-excitation blocks rather than from the boundary.
 
 Two limits of this path as it stands:
 
-- **GRIB2 output does not work on a crop.** `src/nc2grib.py` hardcodes the HRRR grid
-  as `nx=1799, ny=1059`, so the script defaults to `NO_GRIB2=YES`. NetCDF only.
+- **GRIB2 output works on a crop** as of 2026-07-30. `src/nc2grib.py` previously built
+  Section 3 from a hardcoded `nx=1799, ny=1059` and a hardcoded first grid point, so
+  grib2io rejected cropped data on a shape mismatch and wrote nothing. Section 3 is now
+  derived from the dataset's own coordinates, verified by decoding the output back and
+  comparing against the NetCDF. A GRIB2 conversion that fails now fails the run instead
+  of logging a warning nobody reads.
 - **The input stages always run at full domain.** The regridding weights are fixed at
   1059x1799, so `get_*`/`make_*` cost the same as a full run (about 417 s measured).
   At a small crop that fixed cost, plus a ~210 s model load, dominates the wall clock,

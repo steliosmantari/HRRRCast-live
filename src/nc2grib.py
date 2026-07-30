@@ -130,11 +130,22 @@ class Netcdf2Grib:
     _grib2io_lock = threading.Lock()
 
     def __init__(self, section3: Optional[np.ndarray] = None, pdtn_default: int = 0, drtn_default: int = 3):
-        self.section3 = self._resolve_section3(section3)
+        # An explicitly supplied grid (constructor argument or NETCDF2GRIB_SECTION3)
+        # is authoritative and is never overridden by the data. Absent one, the grid
+        # is derived per dataset in save_grib2(), because a subdomain has different
+        # dimensions AND a different first grid point, and neither is knowable here:
+        # __init__ runs before any dataset is seen.
+        self._section3_pinned = self._explicit_section3(section3)
+        # Full-grid default so a caller driving _build_message() directly, without
+        # going through save_grib2(), behaves exactly as before.
+        self.section3 = (self._section3_pinned if self._section3_pinned is not None
+                         else self.construct_section3_hrrr())
         self.pdtn_default = pdtn_default
         self.drtn_default = drtn_default
 
-    def construct_section3_hrrr(self, nx: int = 1799, ny: int = 1059) -> np.ndarray:
+    def construct_section3_hrrr(self, nx: int = 1799, ny: int = 1059,
+                                lat1: float = 21.138123,
+                                lon1: float = 237.280472) -> np.ndarray:
         """Construct GRIB2 Section 3 for HRRR-like CONUS Lambert Conformal grid at 3 km.
 
         This uses canonical HRRR projection parameters and the full-resolution dimensions
@@ -153,9 +164,12 @@ class Netcdf2Grib:
         this function will attempt to use it. Otherwise, it constructs a fixed array using
         canonical HRRR parameters. You can override via NETCDF2GRIB_SECTION3.
         """
-        # Canonical HRRR LCC parameters (matching HRRR docs)
-        lat1 = 21.138123    # degrees North
-        lon1 = 237.280472   # degrees East
+        # lat1/lon1 are the FIRST grid point, which under scanning mode 64 (WE:SN,
+        # set below) is the south-west corner. They default to the full CONUS grid's
+        # corner but must be passed for a subdomain: cropping moves the corner, and
+        # a crop carrying the full grid's corner produces a valid GRIB2 file that
+        # georeferences every field to the wrong place. Everything else here is a
+        # property of the projection and is invariant under cropping.
         lov = 262.5         # degrees East
         latin1 = 38.5       # degrees North
         latin2 = 38.5       # degrees North
@@ -222,25 +236,89 @@ class Netcdf2Grib:
 
         return section3
 
-    def _resolve_section3(self, section3: Optional[np.ndarray]) -> np.ndarray:
+    def _explicit_section3(self, section3: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """The caller-supplied grid, or None if the grid should come from the data.
+
+        Returns None rather than falling back to the full-grid constants, so
+        section3_from_dataset() can tell "nothing was pinned" from "the full grid
+        was pinned deliberately".
+        """
         if section3 is not None:
             return np.asarray(section3, dtype=np.int64)
         env_path = os.environ.get("NETCDF2GRIB_SECTION3", "")
         if env_path and os.path.isfile(env_path):
             try:
-                arr = np.load(env_path)
-                return np.asarray(arr, dtype=np.int64)
+                return np.asarray(np.load(env_path), dtype=np.int64)
             except Exception as e:
                 raise RuntimeError(f"Failed to load section3 from {env_path}: {e}")
-        # Fallback: attempt to construct HRRR-like 3 km LCC Section 3 using known dims (Nx=1799, Ny=1059)
+        return None
+
+    def section3_from_dataset(self, ds: xr.Dataset) -> np.ndarray:
+        """Section 3 for whatever grid this dataset actually covers.
+
+        Only five entries of Section 3 depend on the domain: the number of data
+        points, Nx, Ny, La1 and Lo1. Shape of earth, LoV, LaD, Latin1/Latin2, Dx/Dy,
+        the projection-centre flag and the scanning mode are all properties of the
+        Lambert conformal projection and are unchanged by taking a window on it.
+
+        Verified against real output: for the full 1059x1799 grid this reproduces the
+        previously hardcoded lat1=21.138123 / lon1=237.280472 exactly, so the
+        full-domain path is bit-identical to before. For a 155x151 crop it yields
+        31.652016 / 240.344094, which the old code got wrong.
+        """
+        if self._section3_pinned is not None:
+            pinned = self._section3_pinned
+            # A pinned grid wins, but a .npy pinned for a different domain is exactly
+            # how this bug gets reintroduced, so say so rather than writing a
+            # misgeoreferenced file in silence.
+            try:
+                lat = np.asarray(ds["latitude"].values)
+                if pinned[1] != lat.size:
+                    logger.warning(
+                        "Section 3 was supplied explicitly and declares %d data points, "
+                        "but this dataset has %d (%dx%d). The supplied grid is being used "
+                        "as given; if it does not describe this domain the GRIB2 output "
+                        "will be georeferenced incorrectly.",
+                        int(pinned[1]), lat.size, lat.shape[0], lat.shape[1])
+            except Exception:
+                pass
+            return pinned
+
         try:
-            return self.construct_section3_hrrr(nx=1799, ny=1059)
+            lat = np.asarray(ds["latitude"].values)
+            lon = np.asarray(ds["longitude"].values)
+        except KeyError as e:
+            raise RuntimeError(
+                "GRIB2 Section 3 must be derived from the dataset's latitude/longitude "
+                f"coordinates, which are missing ({e}). Supply 'section3' to Netcdf2Grib "
+                "or set NETCDF2GRIB_SECTION3 to a .npy file for this grid."
+            ) from e
+        if lat.ndim != 2 or lat.shape != lon.shape:
+            raise RuntimeError(
+                f"expected 2-D matching latitude/longitude, got {lat.shape} and {lon.shape}")
+
+        ny, nx = lat.shape
+        # Scanning mode 64 (WE:SN) puts the first grid point at the south-west corner.
+        # Assert that rather than assume it: the HRRR grid is stored south-to-north and
+        # west-to-east, and so is any crop of it, but a future input written the other
+        # way round would otherwise place the corner at the wrong end of the domain.
+        if not (lat[0, 0] < lat[-1, 0] and lon[0, 0] < lon[0, -1]):
+            raise RuntimeError(
+                "grid is not stored south-to-north / west-to-east, so index [0,0] is not "
+                "the first grid point under scanning mode 64 (WE:SN). Section 3 cannot be "
+                f"derived safely: lat[0,0]={lat[0,0]}, lat[-1,0]={lat[-1,0]}, "
+                f"lon[0,0]={lon[0,0]}, lon[0,-1]={lon[0,-1]}")
+
+        try:
+            return self.construct_section3_hrrr(
+                nx=int(nx), ny=int(ny),
+                lat1=float(lat[0, 0]),
+                lon1=float(lon[0, 0]) % 360.0,   # GRIB2 wants degrees East
+            )
         except Exception as e:
             raise RuntimeError(
-                "GRIB2 Section 3 (grid definition) is required and could not be auto-constructed. "
-                "Provide 'section3' to Netcdf2Grib, set NETCDF2GRIB_SECTION3 to a .npy file, or ensure grib2io LCC helper is available. "
-                f"Error: {e}"
-            )
+                "GRIB2 Section 3 (grid definition) could not be constructed for this "
+                f"dataset ({nx}x{ny}). Error: {e}")
 
     def _build_message(
         self,
@@ -364,6 +442,11 @@ class Netcdf2Grib:
         ds_hour is expected to have dims (time=1, lead_time=1, [level], y, x) and contain
         both pressure-level and surface variables.
         """
+        # Resolve the grid from THIS dataset before any message is built. Netcdf2Grib
+        # is constructed per output file (see fcst.py), so mutating self here is
+        # confined to one file and one thread.
+        self.section3 = self.section3_from_dataset(ds_hour)
+
         # Extract lead hour
         try:
             lead = int(np.asarray(ds_hour["lead_time"]).item())
@@ -425,8 +508,17 @@ class Netcdf2Grib:
                     msg.data = np.asarray(vals2d)
                     messages_to_write.append(msg)
         except Exception as e:
-            logger.warning("Error preparing GRIB messages: %s", e)
-            return
+            # Raise rather than warn-and-return. Returning here produced no file, no
+            # exception and a WARNING the caller never saw, so a GRIB2 conversion that
+            # failed for every field looked like success. That is exactly how the
+            # subdomain case presented: grib2io rejected the data with "Data shape
+            # mismatch: expected (1059, 1799), got (155, 151)" because Section 3 was
+            # hardcoded to the full grid, and the run reported no error at all.
+            #
+            # Variables absent from GRIB_PARAM_MAP are skipped explicitly above, so
+            # nothing routine reaches this handler.
+            raise RuntimeError(
+                f"failed preparing GRIB2 messages for {outfile}: {e}") from e
 
         # Now serialize the grib2io operations (g2c library may not be thread-safe)
         with self._grib2io_lock:
