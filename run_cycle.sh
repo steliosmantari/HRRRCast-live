@@ -90,6 +90,13 @@ NO_DIFFUSION=${NO_DIFFUSION:-NO}     # --no_diffusion when YES (deterministic mo
 # NO_NUDGING was removed: upstream deleted nudging from src/fcst.py entirely
 # (commit fd13a09), so passing --no_nudging is now an argparse error.
 
+# GFS cycle selection (src/get_bcs.py --gfs_min_lag_hours). 0 = newest cycle, which
+# is what every run to date used. GFS takes about 4 h to publish a cycle while the
+# HRRR analysis lands in about 51 min, so with 0 the freshest GFS is still missing
+# for 12 of the 24 hours in a day. Set GFS_MIN_LAG=4 for a fixed hourly schedule;
+# aws/pick_cycle.sh emits the value it decided on.
+GFS_MIN_LAG=${GFS_MIN_LAG:-0}
+
 # Output/delivery knobs (defaults preserve the original local behavior).
 NO_GRIB2=${NO_GRIB2:-NO}             # YES -> --no_grib2, NetCDF only
 NC_COMPLEVEL=${NC_COMPLEVEL:-0}      # --nc_complevel; 0 = uncompressed (original behavior)
@@ -170,7 +177,8 @@ run_input_stages() {
 
     # --- Stage 2: get BCs  (jobs/job-get-bcs.sh) ----------------------------
     run_stage get-bcs \
-        python3 "${PACKAGEROOT}/src/get_bcs.py" "${INIT_TIME}" "${LEAD_HOUR}" --base_dir "${DATAROOT}"
+        python3 "${PACKAGEROOT}/src/get_bcs.py" "${INIT_TIME}" "${LEAD_HOUR}" --base_dir "${DATAROOT}" \
+            --gfs_min_lag_hours "${GFS_MIN_LAG}"
 
     # --- Stage 3: make ICs  (depends on get-ics; jobs/job-make-ics.sh) ------
     run_stage make-ics \
